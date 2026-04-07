@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Heavy data — not tracked
+datasets/
+checkpoints/
+vendor/
+
+# Training outputs (weights, logs)
+cellvit_distill/runs/
+*.log
+
+# Notebook outputs & checkpoints
+notebooks/*.png
+notebooks/*_executed.ipynb
+.ipynb_checkpoints/
+
+# PDFs (papers)
+*.pdf
+
+# OS
+.DS_Store
+Thumbs.db
+
+# uv lock (optional — can track if you want reproducible deps)
+# uv.lock

@@ -1,0 +1,106 @@
+# CellViT Distillation Pipeline Config
+
+# --- Data ---
+data:
+  dataset: pannuke
+  data_dir: /home/corzent/caspian/thesis/datasets/pannuke
+  soft_targets_dir: /home/corzent/caspian/thesis/datasets/pannuke/soft_targets
+  patch_size: 256
+  num_classes: 6  # 5 cell types + background
+  num_workers: 4
+  # PanNuke 3-fold cross-validation
+  # fold1: train, fold2: val, fold3: test (rotate for 3-fold CV)
+  train_folds: [1, 2]
+  val_fold: 3
+
+# --- Student Model ---
+student:
+  encoder: convnext_tiny  # options: convnext_tiny, resnet50, efficientnet_b0, mobilenetv3
+  encoder_pretrained: true
+  decoder_channels: [256, 128, 64, 32]
+  # Output heads (HoVer-Net style)
+  heads:
+    binary: 2       # nucleus vs background
+    hv_map: 2       # horizontal + vertical distance maps
+    type_map: 6     # 5 cell types + background
+
+# --- Teacher Model ---
+teacher:
+  name: cellvit_sam_h
+  checkpoint: /home/corzent/caspian/thesis/checkpoints/CellViT-SAM-H-x40.pth
+  # Set to true to pre-compute soft targets (recommended for 16GB GPU)
+  precompute_soft_targets: true
+
+# --- Training ---
+training:
+  epochs: 130
+  batch_size: 8
+  optimizer: adamw
+  lr: 3.0e-4
+  weight_decay: 1.0e-5
+  scheduler: cosine
+  warmup_epochs: 10
+  grad_clip: 1.0
+  mixed_precision: true  # fp16
+
+  # Loss weights for ground truth supervision
+  loss_weights:
+    binary_ce: 1.0
+    binary_dice: 1.0
+    hv_mse: 2.0
+    hv_msge: 8.0      # mean squared gradient error
+    type_ce: 1.0
+    type_dice: 1.0
+
+  # Focal loss config (improves rare-class recall, esp. Dead class)
+  use_focal: true
+  focal_gamma: 2.0
+
+  # Per-class weights for type classification head
+  # Computed from PanNuke inverse frequency: w_c = median_freq / freq_c
+  # Classes: [background, neoplastic, inflammatory, connective, dead, epithelial]
+  # Background is down-weighted; Dead is heavily up-weighted (only 1.5% of nuclei)
+  type_class_weights: [0.5, 1.0, 4.88, 3.04, 50.0, 3.5]
+
+  # Distillation config (only for experiment 2)
+  distillation:
+    enabled: false       # set to true for distillation experiment
+    alpha: 0.2          # lower alpha — GT signal more important for small student
+    temperature: 10.0   # higher T to soften teacher logits (were near one-hot at T=4)
+    loss_type: kl_div   # kl_div, mse, or combined
+    # Per-head distillation weights
+    head_weights:
+      binary: 1.0
+      hv_map: 1.0
+      type_map: 1.0
+
+# --- Augmentation ---
+augmentation:
+  strong: true  # stronger augmentations: elastic, coarse dropout, heavier color jitter
+  horizontal_flip: true
+  vertical_flip: true
+  random_rotate90: true
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.2
+    hue: 0.08
+  gaussian_blur:
+    prob: 0.3
+    kernel_size: 3
+  # Stain normalization (Macenko)
+  stain_normalize: false
+
+# --- Evaluation ---
+evaluation:
+  metrics: [mPQ, bPQ, F1_detection]
+  iou_threshold: 0.5
+  save_predictions: true
+
+# --- Logging ---
+logging:
+  project: cellvit-distillation
+  wandb: true
+  log_every_n_steps: 50
+  save_checkpoint_every: 10
+  output_dir: /home/corzent/caspian/thesis/cellvit_distill/runs

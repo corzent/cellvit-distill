@@ -24,8 +24,72 @@ from cellvit_distill.utils.postprocess import post_process_predictions
 from cellvit_distill.utils.metrics import compute_all_metrics
 
 
+def _tta_predict(model, images: torch.Tensor):
+    """8-way TTA: {identity, hflip, vflip, hvflip} x {rot0, rot90}.
+
+    HV maps need sign correction under reflections and swapping under 90° rotation:
+      hflip: h <- -h
+      vflip: v <- -v
+      rot90 (CCW): (h, v) -> (v, -h)
+    Returns averaged binary_prob (B, H, W), hv (B, 2, H, W), type_prob (B, C, H, W).
+    """
+    accum_bin = 0.0
+    accum_hv = 0.0
+    accum_type = 0.0
+    n = 0
+
+    def forward_once(x):
+        with torch.amp.autocast("cuda"):
+            out = model(x)
+        return (
+            torch.softmax(out["binary"].float(), dim=1)[:, 1],
+            out["hv_map"].float(),
+            torch.softmax(out["type_map"].float(), dim=1),
+        )
+
+    # Identity + 3 flips + 90° rotation of each (8 total)
+    for do_rot in (False, True):
+        x = torch.rot90(images, k=1, dims=(-2, -1)) if do_rot else images
+        for hflip, vflip in [(False, False), (True, False), (False, True), (True, True)]:
+            xi = x
+            if hflip:
+                xi = torch.flip(xi, dims=(-1,))
+            if vflip:
+                xi = torch.flip(xi, dims=(-2,))
+
+            b, hv, t = forward_once(xi)
+
+            # Undo spatial transforms, inverting in reverse order
+            if vflip:
+                b = torch.flip(b, dims=(-2,))
+                hv = torch.flip(hv, dims=(-2,))
+                hv[:, 1] = -hv[:, 1]  # vertical component flips sign
+                t = torch.flip(t, dims=(-2,))
+            if hflip:
+                b = torch.flip(b, dims=(-1,))
+                hv = torch.flip(hv, dims=(-1,))
+                hv[:, 0] = -hv[:, 0]  # horizontal component flips sign
+                t = torch.flip(t, dims=(-1,))
+            if do_rot:
+                # rot90(k=1) was CCW; undo with rot90(k=-1)
+                b = torch.rot90(b, k=-1, dims=(-2, -1))
+                hv = torch.rot90(hv, k=-1, dims=(-2, -1))
+                # Under CCW rot90, (h, v) mapped to (v, -h); inverse: (h, v) = (-v_rot, h_rot)
+                h_rot, v_rot = hv[:, 0].clone(), hv[:, 1].clone()
+                hv[:, 0] = -v_rot
+                hv[:, 1] = h_rot
+                t = torch.rot90(t, k=-1, dims=(-2, -1))
+
+            accum_bin = accum_bin + b
+            accum_hv = accum_hv + hv
+            accum_type = accum_type + t
+            n += 1
+
+    return accum_bin / n, accum_hv / n, accum_type / n
+
+
 @torch.no_grad()
-def evaluate(model, dataloader, device, num_classes=5):
+def evaluate(model, dataloader, device, num_classes=5, tta=False):
     """Run student on dataset and compute metrics."""
     model.eval()
     all_pred_instances = []
@@ -33,21 +97,23 @@ def evaluate(model, dataloader, device, num_classes=5):
     all_pred_types = []
     all_gt_types = []
 
-    for batch in tqdm(dataloader, desc="Evaluating"):
+    for batch in tqdm(dataloader, desc="Evaluating" + (" (TTA)" if tta else "")):
         images = batch["image"].to(device)
 
-        with torch.amp.autocast("cuda"):
-            outputs = model(images)
-
-        binary_pred = torch.softmax(outputs["binary"], dim=1)[:, 1]
-        hv_pred = outputs["hv_map"]
-        type_pred = torch.softmax(outputs["type_map"], dim=1)
+        if tta:
+            binary_pred, hv_pred, type_pred = _tta_predict(model, images)
+        else:
+            with torch.amp.autocast("cuda"):
+                outputs = model(images)
+            binary_pred = torch.softmax(outputs["binary"].float(), dim=1)[:, 1]
+            hv_pred = outputs["hv_map"].float()
+            type_pred = torch.softmax(outputs["type_map"].float(), dim=1)
 
         for i in range(images.shape[0]):
             pred_inst, pred_type = post_process_predictions(
-                binary_pred[i].float().cpu().numpy(),
-                hv_pred[i].float().cpu().numpy(),
-                type_pred[i].float().cpu().numpy(),
+                binary_pred[i].cpu().numpy(),
+                hv_pred[i].cpu().numpy(),
+                type_pred[i].cpu().numpy(),
             )
             gt_inst = batch["instance_map"][i].numpy()
             gt_type = batch["type_map"][i].argmax(dim=0).numpy()
@@ -73,6 +139,8 @@ def main():
                         help="Checkpoint filename (default: best_model.pth)")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--test_fold", type=int, default=3)
+    parser.add_argument("--tta", action="store_true",
+                        help="Enable 8-way test-time augmentation (flips + 90° rotation)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -108,10 +176,12 @@ def main():
 
     # Evaluate
     metrics = evaluate(model, dataloader, device,
-                       num_classes=cfg["data"]["num_classes"] - 1)
+                       num_classes=cfg["data"]["num_classes"] - 1,
+                       tta=args.tta)
 
     experiment = "distill" if cfg["training"]["distillation"]["enabled"] else "baseline"
-    print(f"\n=== {experiment} / {cfg['student']['encoder']} (fold {args.test_fold}) ===")
+    tta_tag = " [TTA]" if args.tta else ""
+    print(f"\n=== {experiment} / {cfg['student']['encoder']} (fold {args.test_fold}){tta_tag} ===")
     print(f"  bPQ:  {metrics['bPQ']:.4f}")
     print(f"  mPQ:  {metrics['mPQ']:.4f}")
     print(f"  F1:   {metrics['F1_detection']:.4f}")
@@ -123,7 +193,8 @@ def main():
 
     # Save results
     import json
-    results_path = run_dir / f"eval_fold{args.test_fold}.json"
+    tta_suffix = "_tta" if args.tta else ""
+    results_path = run_dir / f"eval_fold{args.test_fold}{tta_suffix}.json"
     with open(results_path, "w") as f:
         json.dump(metrics, f, indent=2)
     print(f"\nResults saved to: {results_path}")

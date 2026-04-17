@@ -121,6 +121,7 @@ class StudentCellViT(nn.Module):
         num_classes: int = 6,
         tissue_aux: bool = False,
         num_tissue_classes: int = 19,
+        hv_tanh: bool = False,
     ):
         super().__init__()
         self.encoder_name = encoder_name
@@ -159,11 +160,13 @@ class StudentCellViT(nn.Module):
             nn.Conv2d(feat_ch, 2, 1),
         )
 
-        # HV map head: horizontal + vertical distance maps
-        self.hv_head = nn.Sequential(
-            ConvBNReLU(feat_ch, feat_ch),
-            nn.Conv2d(feat_ch, 2, 1),
-        )
+        # HV map head: horizontal + vertical distance maps.
+        # Optional tanh activation enforces the target range [-1, 1] exactly
+        # for cleaner gradients at the boundary (config: student.hv_tanh).
+        hv_layers = [ConvBNReLU(feat_ch, feat_ch), nn.Conv2d(feat_ch, 2, 1)]
+        if hv_tanh:
+            hv_layers.append(nn.Tanh())
+        self.hv_head = nn.Sequential(*hv_layers)
 
         # Type classification head
         self.type_head = nn.Sequential(
@@ -244,4 +247,5 @@ def build_student(cfg: dict) -> StudentCellViT:
         num_classes=student_cfg["heads"]["type_map"],
         tissue_aux=student_cfg.get("tissue_aux", False),
         num_tissue_classes=student_cfg.get("num_tissue_classes", 19),
+        hv_tanh=student_cfg.get("hv_tanh", False),
     )

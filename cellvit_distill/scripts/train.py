@@ -26,7 +26,7 @@ from datetime import datetime
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.amp import GradScaler, autocast
 import yaml
 
@@ -37,6 +37,46 @@ from cellvit_distill.models.student import build_student
 from cellvit_distill.utils.losses import CombinedLoss
 from cellvit_distill.utils.postprocess import post_process_predictions
 from cellvit_distill.utils.metrics import compute_all_metrics
+
+
+def compute_sample_weights(dataset: PanNukeDataset, num_classes: int = 5) -> np.ndarray:
+    """Inverse-frequency sample weights for class-balanced sampling.
+
+    For each patch, weight = max inverse-frequency over classes present.
+    Patches containing rare classes (e.g., Dead) get higher sampling weight,
+    encouraging every epoch to see more examples of under-represented classes.
+    """
+    # Count per-class nucleus presence across dataset.
+    class_presence = np.zeros(num_classes, dtype=np.int64)
+    per_patch_classes = []
+    print("Computing class-balanced sample weights...")
+    for idx in range(len(dataset)):
+        _, _, masks_mmap, _ = dataset._resolve_index(idx)
+        local_idx = idx - dataset._cumulative_sizes[
+            next(i for i in range(len(dataset._cumulative_sizes) - 1)
+                 if idx < dataset._cumulative_sizes[i + 1])
+        ]
+        masks = masks_mmap[local_idx]
+        present = np.zeros(num_classes, dtype=bool)
+        for c in range(num_classes):
+            if np.any(masks[:, :, c] > 0):
+                present[c] = True
+                class_presence[c] += 1
+        per_patch_classes.append(present)
+
+    # Inverse frequency per class
+    total = len(dataset)
+    inv_freq = total / (class_presence + 1)  # +1 to avoid div by zero
+
+    # Per-patch weight = max inverse frequency over classes present; 1.0 for empty
+    weights = np.ones(total, dtype=np.float64)
+    for i, present in enumerate(per_patch_classes):
+        if present.any():
+            weights[i] = float(inv_freq[present].max())
+
+    print(f"Class presence: {class_presence.tolist()}")
+    print(f"Sample weight stats: min={weights.min():.2f}, max={weights.max():.2f}, mean={weights.mean():.2f}")
+    return weights
 
 
 def load_config(config_path: str, overrides: list = None) -> dict:
@@ -214,14 +254,31 @@ def main():
         transform=get_val_transform(),
     )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg["training"]["batch_size"],
-        shuffle=True,
-        num_workers=cfg["data"]["num_workers"],
-        pin_memory=True,
-        drop_last=True,
-    )
+    # Class-balanced sampling (optional; NuLite recipe)
+    if cfg["training"].get("class_balanced_sampling", False):
+        weights = compute_sample_weights(train_dataset, num_classes=5)
+        sampler = WeightedRandomSampler(
+            weights=torch.from_numpy(weights).double(),
+            num_samples=len(train_dataset),
+            replacement=True,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=cfg["training"]["batch_size"],
+            sampler=sampler,
+            num_workers=cfg["data"]["num_workers"],
+            pin_memory=True,
+            drop_last=True,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=cfg["training"]["batch_size"],
+            shuffle=True,
+            num_workers=cfg["data"]["num_workers"],
+            pin_memory=True,
+            drop_last=True,
+        )
     val_loader = DataLoader(
         val_dataset,
         batch_size=cfg["training"]["batch_size"],
@@ -289,6 +346,9 @@ def main():
 
     # --- Training Loop ---
     best_mpq = 0.0
+    epochs_without_improvement = 0
+    val_every = cfg["training"].get("val_every_n_epochs", 5)
+    early_stop_patience = cfg["training"].get("early_stop_patience", 0)  # 0 disables
 
     for epoch in range(1, num_epochs + 1):
         t0 = time.time()
@@ -300,9 +360,9 @@ def main():
 
         combined_scheduler.step()
 
-        # Validate every 5 epochs or at the end
+        # Validation frequency (per config; default every 5 epochs)
         val_results = {}
-        if epoch % 5 == 0 or epoch == num_epochs:
+        if epoch % val_every == 0 or epoch == num_epochs:
             val_results = validate(
                 model, val_loader, criterion, device,
                 num_classes=cfg["data"]["num_classes"] - 1,
@@ -340,11 +400,19 @@ def main():
         if epoch % cfg["logging"]["save_checkpoint_every"] == 0 or epoch == num_epochs:
             torch.save(ckpt, run_dir / f"checkpoint_epoch{epoch}.pth")
 
-        # Save best
-        if val_results and val_results.get("mPQ", 0) > best_mpq:
-            best_mpq = val_results["mPQ"]
-            torch.save(ckpt, run_dir / "best_model.pth")
-            print(f"  New best mPQ: {best_mpq:.4f}")
+        # Save best + track early stopping
+        if val_results:
+            if val_results.get("mPQ", 0) > best_mpq:
+                best_mpq = val_results["mPQ"]
+                torch.save(ckpt, run_dir / "best_model.pth")
+                print(f"  New best mPQ: {best_mpq:.4f}")
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += val_every
+                if early_stop_patience > 0 and epochs_without_improvement >= early_stop_patience:
+                    print(f"\nEarly stopping: {epochs_without_improvement} epochs without mPQ improvement "
+                          f"(patience={early_stop_patience})")
+                    break
 
     print(f"\nTraining complete. Best mPQ: {best_mpq:.4f}")
     print(f"Checkpoints saved to: {run_dir}")

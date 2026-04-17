@@ -99,6 +99,50 @@ class FocalLoss(nn.Module):
         return loss.sum()
 
 
+class FocalTverskyLoss(nn.Module):
+    """Focal Tversky Loss (Abraham & Khan 2019).
+
+    Generalizes Dice: Tversky index = TP / (TP + alpha*FN + beta*FP).
+    Setting alpha > beta penalizes false negatives more (useful for small
+    nuclei that are easily missed). Focal exponent gamma < 1 focuses on
+    hard examples.
+
+    FTL = (1 - Tversky)^gamma, summed over foreground classes.
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.7,
+        beta: float = 0.3,
+        gamma: float = 0.75,
+        smooth: float = 1e-6,
+    ):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.smooth = smooth
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred: (B, C, H, W) softmax probabilities
+            target: (B, C, H, W) one-hot encoded
+        """
+        pred = pred.contiguous().view(pred.shape[0], pred.shape[1], -1)
+        target = target.contiguous().view(target.shape[0], target.shape[1], -1)
+
+        tp = (pred * target).sum(dim=2)
+        fn = (target * (1 - pred)).sum(dim=2)
+        fp = ((1 - target) * pred).sum(dim=2)
+
+        tversky = (tp + self.smooth) / (tp + self.alpha * fn + self.beta * fp + self.smooth)
+        # Skip background (class 0) and focus on foreground classes.
+        if tversky.shape[1] > 1:
+            tversky = tversky[:, 1:]
+        return ((1 - tversky) ** self.gamma).mean()
+
+
 class MSGELoss(nn.Module):
     """Mean Squared Gradient Error for HV maps.
 
@@ -149,7 +193,10 @@ class MSGELoss(nn.Module):
 class CellSegLoss(nn.Module):
     """Combined ground truth loss for cell segmentation (HoVer-Net style).
 
-    Supports optional focal loss and per-class weights for type classification.
+    Supports optional focal loss and per-class weights for type classification,
+    optional Focal Tversky Loss for binary head (NuLite recipe), and an
+    optional tissue classification auxiliary task to encourage richer encoder
+    representations.
     """
 
     def __init__(
@@ -158,14 +205,19 @@ class CellSegLoss(nn.Module):
         use_focal: bool = False,
         focal_gamma: float = 2.0,
         type_class_weights: Optional[List[float]] = None,
+        use_ftl_binary: bool = False,
+        tissue_aux: bool = False,
     ):
         super().__init__()
         self.weights = loss_weights
         self.dice = DiceLoss()
         self.mse = nn.MSELoss()
         self.msge = MSGELoss()
+        self.ftl = FocalTverskyLoss() if use_ftl_binary else None
+        self.use_ftl_binary = use_ftl_binary
+        self.tissue_aux = tissue_aux
 
-        # Binary head loss (always plain CE — only 2 classes, well balanced within nuclei)
+        # Binary head loss
         self.binary_ce = nn.CrossEntropyLoss()
 
         # Type head loss: focal + class weights or plain CE + class weights
@@ -176,6 +228,9 @@ class CellSegLoss(nn.Module):
             self.type_cls_loss = nn.CrossEntropyLoss(
                 weight=type_w if type_w is not None else None,
             )
+
+        # Tissue classification aux head — 19 PanNuke tissue types
+        self.tissue_ce = nn.CrossEntropyLoss() if tissue_aux else None
 
         self.use_focal = use_focal
 
@@ -204,11 +259,15 @@ class CellSegLoss(nn.Module):
         binary_pred = pred["binary"]
         binary_target = target["binary_map"]
         binary_target_class = binary_target.argmax(dim=1)  # (B, H, W) class indices
+        binary_probs = F.softmax(binary_pred, dim=1)
 
-        losses["binary_ce"] = self.binary_ce(binary_pred, binary_target_class) * self.weights["binary_ce"]
-        losses["binary_dice"] = self.dice(
-            F.softmax(binary_pred, dim=1), binary_target
-        ) * self.weights["binary_dice"]
+        if self.use_ftl_binary:
+            # NuLite recipe: FTL + Dice, more sensitive to false negatives
+            losses["binary_ftl"] = self.ftl(binary_probs, binary_target) * self.weights["binary_ce"]
+            losses["binary_dice"] = self.dice(binary_probs, binary_target) * self.weights["binary_dice"]
+        else:
+            losses["binary_ce"] = self.binary_ce(binary_pred, binary_target_class) * self.weights["binary_ce"]
+            losses["binary_dice"] = self.dice(binary_probs, binary_target) * self.weights["binary_dice"]
 
         # --- HV map head ---
         hv_pred = pred["hv_map"]
@@ -235,6 +294,12 @@ class CellSegLoss(nn.Module):
         losses["type_dice"] = self.dice(
             F.softmax(type_pred, dim=1), type_target
         ) * self.weights["type_dice"]
+
+        # --- Tissue classification aux task (optional) ---
+        if self.tissue_aux and "tissue_logits" in pred and "tissue_label" in target:
+            losses["tissue_ce"] = self.tissue_ce(
+                pred["tissue_logits"], target["tissue_label"]
+            ) * self.weights.get("tissue_ce", 0.1)
 
         losses["total"] = sum(v for k, v in losses.items() if k != "total")
         return losses
@@ -325,6 +390,8 @@ class CombinedLoss(nn.Module):
         use_focal: bool = False,
         focal_gamma: float = 2.0,
         type_class_weights: Optional[List[float]] = None,
+        use_ftl_binary: bool = False,
+        tissue_aux: bool = False,
     ):
         super().__init__()
         self.alpha = alpha
@@ -334,6 +401,8 @@ class CombinedLoss(nn.Module):
             use_focal=use_focal,
             focal_gamma=focal_gamma,
             type_class_weights=type_class_weights,
+            use_ftl_binary=use_ftl_binary,
+            tissue_aux=tissue_aux,
         )
 
         if distillation_enabled:

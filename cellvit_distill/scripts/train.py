@@ -249,13 +249,17 @@ def main():
         use_focal=cfg["training"].get("use_focal", False),
         focal_gamma=cfg["training"].get("focal_gamma", 2.0),
         type_class_weights=cfg["training"].get("type_class_weights"),
+        use_ftl_binary=cfg["training"].get("use_ftl_binary", False),
+        tissue_aux=cfg["student"].get("tissue_aux", False),
     )
 
     # --- Optimizer & Scheduler ---
+    betas = tuple(cfg["training"].get("adamw_betas", [0.9, 0.999]))
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg["training"]["lr"],
         weight_decay=cfg["training"]["weight_decay"],
+        betas=betas,
     )
 
     num_epochs = cfg["training"]["epochs"]

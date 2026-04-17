@@ -101,8 +101,13 @@ class StudentCellViT(nn.Module):
     """
 
     # Encoder configs: name -> (timm model name, feature channels per stage)
+    # Channels are auto-detected via a dummy forward pass; values here are
+    # for reference only (used when timm is unavailable).
     ENCODER_CONFIGS = {
         "convnext_tiny": ("convnext_tiny.fb_in22k", [96, 192, 384, 768]),
+        "fastvit_s12": ("fastvit_s12.apple_in1k", [64, 128, 256, 512]),
+        "fastvit_sa12": ("fastvit_sa12.apple_in1k", [64, 128, 256, 512]),
+        "fastvit_sa24": ("fastvit_sa24.apple_in1k", [64, 128, 256, 512]),
         "resnet50": ("resnet50.a1_in1k", [256, 512, 1024, 2048]),
         "efficientnet_b0": ("efficientnet_b0.ra_in1k", [24, 40, 112, 320]),
         "mobilenetv3": ("mobilenetv3_large_100.ra_in1k", [24, 40, 112, 960]),
@@ -114,10 +119,13 @@ class StudentCellViT(nn.Module):
         pretrained: bool = True,
         decoder_channels: List[int] = [256, 128, 64, 32],
         num_classes: int = 6,
+        tissue_aux: bool = False,
+        num_tissue_classes: int = 19,
     ):
         super().__init__()
         self.encoder_name = encoder_name
         self.num_classes = num_classes
+        self.tissue_aux = tissue_aux
 
         # Get encoder config
         if encoder_name not in self.ENCODER_CONFIGS:
@@ -163,6 +171,19 @@ class StudentCellViT(nn.Module):
             nn.Conv2d(feat_ch, num_classes, 1),
         )
 
+        # Tissue classification aux head — global AvgPool over deepest encoder
+        # features + linear classifier. Encourages the encoder to learn
+        # tissue-aware representations (NuLite recipe).
+        if tissue_aux:
+            bottleneck_ch = encoder_channels[-1]
+            self.tissue_head = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Linear(bottleneck_ch, num_tissue_classes),
+            )
+        else:
+            self.tissue_head = None
+
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -184,11 +205,14 @@ class StudentCellViT(nn.Module):
         if decoded.shape[2:] != input_size:
             decoded = F.interpolate(decoded, size=input_size, mode="bilinear", align_corners=False)
 
-        return {
+        out = {
             "binary": self.binary_head(decoded),
             "hv_map": self.hv_head(decoded),
             "type_map": self.type_head(decoded),
         }
+        if self.tissue_head is not None:
+            out["tissue_logits"] = self.tissue_head(features[-1])
+        return out
 
     def count_parameters(self) -> Dict[str, int]:
         """Count trainable parameters per component."""
@@ -212,9 +236,12 @@ class StudentCellViT(nn.Module):
 
 def build_student(cfg: dict) -> StudentCellViT:
     """Build student model from config dict."""
+    student_cfg = cfg["student"]
     return StudentCellViT(
-        encoder_name=cfg["student"]["encoder"],
-        pretrained=cfg["student"]["encoder_pretrained"],
-        decoder_channels=cfg["student"]["decoder_channels"],
-        num_classes=cfg["student"]["heads"]["type_map"],
+        encoder_name=student_cfg["encoder"],
+        pretrained=student_cfg["encoder_pretrained"],
+        decoder_channels=student_cfg["decoder_channels"],
+        num_classes=student_cfg["heads"]["type_map"],
+        tissue_aux=student_cfg.get("tissue_aux", False),
+        num_tissue_classes=student_cfg.get("num_tissue_classes", 19),
     )

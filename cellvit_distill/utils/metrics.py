@@ -118,35 +118,40 @@ def compute_multi_class_pq(
     gt_type_maps: List[np.ndarray],
     num_classes: int = 5,
 ) -> Dict[str, float]:
-    """Compute multi-class Panoptic Quality (mPQ).
+    """Compute multi-class Panoptic Quality (mPQ) using the CellViT/NuLite protocol.
 
-    Computes PQ per cell type and averages.
+    For each image, PQ is computed per cell class. When an image has no GT
+    instances of a class, that class contributes nan (not 0) for that image.
+    Image-level mPQ is np.nanmean over classes; dataset-level mPQ is np.nanmean
+    of image-level mPQ. Per-class mPQ is np.nanmean over images.
 
-    Args:
-        pred_maps: List of (H, W) predicted instance maps
-        gt_maps: List of (H, W) GT instance maps
-        pred_type_maps: List of (H, W) predicted per-pixel class labels
-        gt_type_maps: List of (H, W) GT per-pixel class labels
-        num_classes: Number of cell classes (excluding background)
+    This matches:
+      mPQ = nanmean_over_images( nanmean_over_classes( PQ[image, class] ) )
+
+    The earlier implementation incorrectly treated absent classes as PQ=0,
+    which drastically underestimates rare classes (e.g., Dead ~1% of images)
+    and inflates the apparent gap to published numbers.
     """
-    class_pqs = {c: [] for c in range(1, num_classes + 1)}
+    per_image_class_pq = []  # list of (num_classes,) arrays, nan where GT empty
 
     for pred_inst, gt_inst, pred_type, gt_type in zip(
         pred_maps, gt_maps, pred_type_maps, gt_type_maps
     ):
-        for cls in range(1, num_classes + 1):
-            # Filter instances by class
+        image_pqs = np.full(num_classes, np.nan, dtype=np.float64)
+
+        for cls_idx, cls in enumerate(range(1, num_classes + 1)):
             pred_cls = np.zeros_like(pred_inst)
             gt_cls = np.zeros_like(gt_inst)
 
-            # For each instance, check its majority class
             for inst_id in np.unique(pred_inst):
                 if inst_id == 0:
                     continue
                 mask = pred_inst == inst_id
                 inst_type = pred_type[mask]
                 if len(inst_type) > 0:
-                    majority_class = np.bincount(inst_type.astype(int), minlength=num_classes + 1).argmax()
+                    majority_class = np.bincount(
+                        inst_type.astype(int), minlength=num_classes + 1
+                    ).argmax()
                     if majority_class == cls:
                         pred_cls[mask] = inst_id
 
@@ -156,17 +161,35 @@ def compute_multi_class_pq(
                 mask = gt_inst == inst_id
                 inst_type = gt_type[mask]
                 if len(inst_type) > 0:
-                    majority_class = np.bincount(inst_type.astype(int), minlength=num_classes + 1).argmax()
+                    majority_class = np.bincount(
+                        inst_type.astype(int), minlength=num_classes + 1
+                    ).argmax()
                     if majority_class == cls:
                         gt_cls[mask] = inst_id
 
+            # Skip images where GT has no instances of this class (CellViT convention)
+            if not np.any(gt_cls):
+                continue
+
             result = panoptic_quality(pred_cls, gt_cls)
-            class_pqs[cls].append(result["PQ"])
+            image_pqs[cls_idx] = result["PQ"]
 
-    per_class_mpq = {c: np.mean(v) if v else 0.0 for c, v in class_pqs.items()}
-    mpq = np.mean(list(per_class_mpq.values()))
+        per_image_class_pq.append(image_pqs)
 
-    return {"mPQ": mpq, **{f"PQ_class_{c}": v for c, v in per_class_mpq.items()}}
+    per_image_class_pq = np.array(per_image_class_pq)  # (N, num_classes)
+
+    with np.errstate(invalid="ignore"):
+        per_image_mpq = np.nanmean(per_image_class_pq, axis=1)  # (N,)
+        mpq = np.nanmean(per_image_mpq)
+        per_class_mpq = np.nanmean(per_image_class_pq, axis=0)  # (num_classes,)
+
+    return {
+        "mPQ": float(mpq) if not np.isnan(mpq) else 0.0,
+        **{
+            f"PQ_class_{c}": float(per_class_mpq[i]) if not np.isnan(per_class_mpq[i]) else 0.0
+            for i, c in enumerate(range(1, num_classes + 1))
+        },
+    }
 
 
 def f1_detection(

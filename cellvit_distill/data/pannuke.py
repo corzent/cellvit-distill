@@ -62,6 +62,7 @@ class PanNukeDataset(Dataset):
         # Load folds with memory-mapped access (avoids loading ~12GB per fold into RAM)
         self._mmap_images = []
         self._mmap_masks = []
+        self._tissue_labels = []  # (N,) per fold, loaded eagerly (small)
         self._fold_sizes = []
         self._cumulative_sizes = [0]
 
@@ -71,8 +72,20 @@ class PanNukeDataset(Dataset):
             msks = np.load(fold_dir / "masks.npy", mmap_mode="r")    # (N, 256, 256, 6)
             self._mmap_images.append(imgs)
             self._mmap_masks.append(msks)
+            types_path = fold_dir / "types.npy"
+            if types_path.exists():
+                self._tissue_labels.append(np.load(types_path, allow_pickle=True))
+            else:
+                self._tissue_labels.append(None)
             self._fold_sizes.append(len(imgs))
             self._cumulative_sizes.append(self._cumulative_sizes[-1] + len(imgs))
+
+        # Build tissue name -> index mapping across folds (stable order)
+        all_tissue_names = set()
+        for labels in self._tissue_labels:
+            if labels is not None:
+                all_tissue_names.update(str(t) for t in labels)
+        self.tissue_name_to_idx = {n: i for i, n in enumerate(sorted(all_tissue_names))}
 
         self._total_len = self._cumulative_sizes[-1]
         print(f"PanNuke: {self._total_len} patches from folds {folds} (memory-mapped)")
@@ -81,12 +94,14 @@ class PanNukeDataset(Dataset):
         return self._total_len
 
     def _resolve_index(self, idx: int):
-        """Map global index to (fold_local_idx, fold_mmap_images, fold_mmap_masks)."""
-        for i, (imgs, msks) in enumerate(zip(self._mmap_images, self._mmap_masks)):
+        """Map global index to (fold_local_idx, fold_mmap_images, fold_mmap_masks, fold_tissue_labels)."""
+        for i, (imgs, msks, tl) in enumerate(
+            zip(self._mmap_images, self._mmap_masks, self._tissue_labels)
+        ):
             offset = self._cumulative_sizes[i]
             if idx < self._cumulative_sizes[i + 1]:
                 local_idx = idx - offset
-                return local_idx, imgs, msks
+                return local_idx, imgs, msks, tl
         raise IndexError(f"Index {idx} out of range [0, {self._total_len})")
 
     def _generate_instance_map(self, masks: np.ndarray) -> np.ndarray:
@@ -188,9 +203,14 @@ class PanNukeDataset(Dataset):
         return np.stack([background, nucleus], axis=0)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        local_idx, imgs_mmap, masks_mmap = self._resolve_index(idx)
+        local_idx, imgs_mmap, masks_mmap, tissue_labels = self._resolve_index(idx)
         image = np.array(imgs_mmap[local_idx])  # copy from mmap -> (256, 256, 3) uint8
         masks = np.array(masks_mmap[local_idx])  # copy from mmap -> (256, 256, 6)
+        tissue_label_idx = (
+            self.tissue_name_to_idx[str(tissue_labels[local_idx])]
+            if tissue_labels is not None
+            else -1
+        )
 
         # Generate targets
         instance_map = self._generate_instance_map(masks)
@@ -293,6 +313,7 @@ class PanNukeDataset(Dataset):
             "hv_map": torch.from_numpy(hv_map).float(),
             "type_map": torch.from_numpy(type_map).float(),
             "instance_map": torch.from_numpy(instance_map.astype(np.int64)).long(),
+            "tissue_label": torch.tensor(tissue_label_idx, dtype=torch.long),
         }
 
         # Add spatially-aligned soft targets

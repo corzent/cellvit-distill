@@ -1,0 +1,103 @@
+# FastViT-S12 student + NuLite training recipe
+# Goal: match or beat NuLite-T (12M params, ~0.50 PQ) on PanNuke via distillation.
+
+# --- Data ---
+data:
+  dataset: pannuke
+  data_dir: /home/corzent/caspian/thesis/datasets/pannuke
+  soft_targets_dir: /home/corzent/caspian/thesis/datasets/pannuke/soft_targets
+  patch_size: 256
+  num_classes: 6
+  num_workers: 4
+  train_folds: [1, 2]
+  val_fold: 3
+
+# --- Student Model ---
+student:
+  encoder: fastvit_s12       # 8.3M encoder, reparameterized hybrid
+  encoder_pretrained: true
+  decoder_channels: [256, 128, 64, 32]
+  heads:
+    binary: 2
+    hv_map: 2
+    type_map: 6
+  tissue_aux: true           # auxiliary 19-class tissue classification (NuLite trick)
+  num_tissue_classes: 19
+
+# --- Teacher Model ---
+teacher:
+  name: cellvit_sam_h
+  checkpoint: /home/corzent/caspian/thesis/checkpoints/CellViT-SAM-H-x40.pth
+  precompute_soft_targets: true
+
+# --- Training ---
+training:
+  epochs: 130
+  batch_size: 8
+  optimizer: adamw
+  lr: 3.0e-4
+  weight_decay: 1.0e-5
+  adamw_betas: [0.85, 0.95]   # NuLite recipe (faster response to grad changes)
+  scheduler: cosine
+  warmup_epochs: 10
+  grad_clip: 1.0
+  mixed_precision: true
+
+  # NuLite recipe: FTL+Dice for binary head (focal Tversky handles small objects)
+  use_ftl_binary: true
+
+  # Loss weights
+  loss_weights:
+    binary_ce: 1.0             # acts as FTL weight when use_ftl_binary=true
+    binary_dice: 1.0
+    hv_mse: 2.0
+    hv_msge: 8.0
+    type_ce: 1.0
+    type_dice: 1.0
+    tissue_ce: 0.1             # aux task, small weight to avoid dominating
+
+  # Focal loss for type head (rare Dead class)
+  use_focal: true
+  focal_gamma: 2.0
+  type_class_weights: [0.5, 1.0, 4.88, 3.04, 50.0, 3.5]
+
+  # Distillation config — enabled via CLI override for experiment 2
+  distillation:
+    enabled: false
+    alpha: 0.2
+    temperature: 10.0
+    loss_type: kl_div
+    head_weights:
+      binary: 1.0
+      hv_map: 0.0              # disabled: sign correction under flips
+      type_map: 1.0
+
+# --- Augmentation ---
+augmentation:
+  strong: true
+  horizontal_flip: true
+  vertical_flip: true
+  random_rotate90: true
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.2
+    hue: 0.08
+  gaussian_blur:
+    prob: 0.3
+    kernel_size: 3
+  stain_normalize: false
+
+# --- Evaluation ---
+evaluation:
+  metrics: [mPQ, bPQ, F1_detection]
+  iou_threshold: 0.5
+  save_predictions: true
+
+# --- Logging ---
+logging:
+  project: cellvit-distillation
+  wandb: false
+  log_every_n_steps: 50
+  save_checkpoint_every: 10
+  output_dir: /home/corzent/caspian/thesis/cellvit_distill/runs

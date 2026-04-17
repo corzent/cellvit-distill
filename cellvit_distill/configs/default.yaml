@@ -69,9 +69,11 @@ training:
     temperature: 10.0   # higher T to soften teacher logits (were near one-hot at T=4)
     loss_type: kl_div   # kl_div, mse, or combined
     # Per-head distillation weights
+    # hv_map set to 0: spatial augmentations (flips, rotations) require sign
+    # correction on HV distance values, and GT HV maps are already exact.
     head_weights:
       binary: 1.0
-      hv_map: 1.0
+      hv_map: 0.0
       type_map: 1.0
 
 # --- Augmentation ---

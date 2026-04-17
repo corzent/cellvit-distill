@@ -201,6 +201,21 @@ class PanNukeDataset(Dataset):
         # Generate per-pixel type class label (needed for augmentation)
         type_class_map = type_map.argmax(axis=0).astype(np.int32)  # (H, W) class indices
 
+        # Load soft targets BEFORE augmentation so they can be spatially transformed
+        # together with the image. Without this, flips/rotations misalign soft targets
+        # with the augmented image, turning distillation loss into noise.
+        soft_data = None
+        if self.soft_targets_dir is not None:
+            st_path = self.soft_targets_dir / f"{idx}.npz"
+            if st_path.exists():
+                # Use context manager to avoid leaking file handles across workers.
+                with np.load(st_path) as st:
+                    soft_data = {
+                        "binary": st["binary"].astype(np.float32, copy=True),
+                        "hv": st["hv"].astype(np.float32, copy=True),
+                        "type": st["type"].astype(np.float32, copy=True),
+                    }
+
         # Apply augmentations
         if self.transform is not None:
             # Convert image to uint8 for albumentations if needed
@@ -212,10 +227,25 @@ class PanNukeDataset(Dataset):
             else:
                 image_uint8 = image
 
-            # Transform image + instance_map + type_class_map with same spatial ops
+            # Build masks list: GT masks + soft target channels (same spatial transform)
+            masks_list = [instance_map.astype(np.int32), type_class_map]
+            if soft_data is not None:
+                # Append each soft target channel as a separate (H, W) mask.
+                # Spatial transforms (flip, rotate90) are exact on float arrays.
+                # Elastic/affine use nearest interpolation — acceptable for logits.
+                soft_binary = soft_data["binary"]  # (2, H, W)
+                soft_type = soft_data["type"]      # (6, H, W)
+                for c in range(soft_binary.shape[0]):
+                    masks_list.append(soft_binary[c].astype(np.float32))
+                for c in range(soft_type.shape[0]):
+                    masks_list.append(soft_type[c].astype(np.float32))
+                # soft_hv excluded: flips require sign correction on distance values,
+                # and GT HV maps (recomputed from instance_map) are already exact.
+
+            # Transform image + all masks with same spatial ops
             transformed = self.transform(
                 image=image_uint8,
-                masks=[instance_map.astype(np.int32), type_class_map],
+                masks=masks_list,
             )
             image = transformed["image"]  # already a tensor from ToTensorV2
             inst_mask = transformed["masks"][0]
@@ -223,6 +253,17 @@ class PanNukeDataset(Dataset):
 
             instance_map_np = inst_mask.numpy() if isinstance(inst_mask, torch.Tensor) else inst_mask
             type_class_np = type_mask.numpy() if isinstance(type_mask, torch.Tensor) else type_mask
+
+            # Recombine soft target channels after augmentation
+            if soft_data is not None:
+                aug_masks = transformed["masks"]
+
+                def _to_np(m):
+                    return m.numpy() if isinstance(m, torch.Tensor) else m
+
+                soft_data["binary"] = np.stack([_to_np(aug_masks[2 + c]) for c in range(2)])
+                soft_data["type"] = np.stack([_to_np(aug_masks[4 + c]) for c in range(6)])
+                # soft_data["hv"] stays unchanged — HV distillation skipped (see config)
 
             # Regenerate maps from spatially-transformed masks
             binary_map = self._generate_binary_map(instance_map_np)
@@ -254,14 +295,11 @@ class PanNukeDataset(Dataset):
             "instance_map": torch.from_numpy(instance_map.astype(np.int64)).long(),
         }
 
-        # Load pre-computed soft targets if available
-        if self.soft_targets_dir is not None:
-            st_path = self.soft_targets_dir / f"{idx}.npz"
-            if st_path.exists():
-                st = np.load(st_path)
-                sample["soft_binary"] = torch.from_numpy(st["binary"]).float()
-                sample["soft_hv"] = torch.from_numpy(st["hv"]).float()
-                sample["soft_type"] = torch.from_numpy(st["type"]).float()
+        # Add spatially-aligned soft targets
+        if soft_data is not None:
+            sample["soft_binary"] = torch.from_numpy(soft_data["binary"]).float()
+            sample["soft_hv"] = torch.from_numpy(soft_data["hv"]).float()
+            sample["soft_type"] = torch.from_numpy(soft_data["type"]).float()
 
         return sample
 
@@ -288,7 +326,7 @@ def get_train_transform(patch_size: int = 256, strong: bool = False) -> A.Compos
             # Affine jitter (small scale + rotation)
             A.Affine(translate_percent={"x": (-0.05, 0.05), "y": (-0.05, 0.05)},
                      scale=(0.9, 1.1), rotate=(-15, 15),
-                     mode=0, p=0.4),
+                     border_mode=0, p=0.4),
             # Stronger color jitter to simulate stain variation
             A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.08, p=0.6),
             A.GaussianBlur(blur_limit=(3, 5), p=0.3),

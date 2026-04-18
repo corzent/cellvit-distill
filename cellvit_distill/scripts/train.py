@@ -241,12 +241,20 @@ def main():
     # --- Data ---
     soft_dir = cfg["data"]["soft_targets_dir"] if dist_cfg["enabled"] else None
 
+    # Feature distillation: load precomputed teacher dense features.
+    feat_distill_enabled = cfg["training"].get("feature_distillation", {}).get("enabled", False)
+    soft_feat_dir = cfg["data"].get("soft_features_dir") if feat_distill_enabled else None
+
     strong_aug = cfg.get("augmentation", {}).get("strong", False)
+    # When feature distill is on, spatial aug is handled manually in dataset
+    # (to sync image aug with low-resolution feature aug).
+    skip_spatial = feat_distill_enabled and soft_feat_dir is not None
     train_dataset = PanNukeDataset(
         data_dir=cfg["data"]["data_dir"],
         folds=cfg["data"]["train_folds"],
-        transform=get_train_transform(cfg["data"]["patch_size"], strong=strong_aug),
+        transform=get_train_transform(cfg["data"]["patch_size"], strong=strong_aug, skip_spatial=skip_spatial),
         soft_targets_dir=soft_dir,
+        soft_features_dir=soft_feat_dir,
     )
     val_dataset = PanNukeDataset(
         data_dir=cfg["data"]["data_dir"],
@@ -297,6 +305,7 @@ def main():
     print(f"  Total:   {param_info['total_M']:.1f}M")
 
     # --- Loss ---
+    fd_cfg = cfg["training"].get("feature_distillation", {})
     criterion = CombinedLoss(
         loss_weights=cfg["training"]["loss_weights"],
         alpha=dist_cfg["alpha"],
@@ -308,6 +317,10 @@ def main():
         type_class_weights=cfg["training"].get("type_class_weights"),
         use_ftl_binary=cfg["training"].get("use_ftl_binary", False),
         tissue_aux=cfg["student"].get("tissue_aux", False),
+        feature_distill_enabled=fd_cfg.get("enabled", False),
+        beta=fd_cfg.get("beta", 1.0),
+        feature_loss_use_cosine=fd_cfg.get("use_cosine", True),
+        feature_loss_cosine_weight=fd_cfg.get("cosine_weight", 0.5),
     )
 
     # --- Optimizer & Scheduler ---

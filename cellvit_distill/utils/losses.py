@@ -305,6 +305,59 @@ class CellSegLoss(nn.Module):
         return losses
 
 
+class FeatureMatchLoss(nn.Module):
+    """Feature-based distillation loss (FitNets-style).
+
+    Matches intermediate student features to teacher ViT-H tokens via a 1x1
+    projection layer that lives inside the student. Combines MSE and
+    (optionally) cosine similarity — cosine captures directional alignment
+    while MSE constrains magnitude.
+
+    The projection is expected to be applied before calling this loss. Inputs
+    should already be at matching spatial resolution (16x16 for SAM-H tokens
+    at 256x256 input, matches FastViT-S12 stage 2 / ConvNeXt-Tiny stage 3).
+    """
+
+    def __init__(self, use_cosine: bool = True, cosine_weight: float = 0.5):
+        super().__init__()
+        self.use_cosine = use_cosine
+        self.cosine_weight = cosine_weight
+
+    @torch.amp.autocast("cuda", enabled=False)
+    def forward(
+        self,
+        student_feat: torch.Tensor,
+        teacher_feat: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            student_feat: (B, C, H, W) after projection to match teacher
+            teacher_feat: (B, C, H, W) pre-computed teacher tokens
+        """
+        student_feat = student_feat.float()
+        teacher_feat = teacher_feat.float()
+
+        # Spatial size mismatch fallback (shouldn't happen if aligned).
+        if student_feat.shape[-2:] != teacher_feat.shape[-2:]:
+            student_feat = F.interpolate(
+                student_feat, size=teacher_feat.shape[-2:],
+                mode="bilinear", align_corners=False,
+            )
+
+        mse = F.mse_loss(student_feat, teacher_feat)
+
+        if not self.use_cosine:
+            return mse
+
+        # Cosine similarity per pixel, averaged.
+        s_norm = F.normalize(student_feat, dim=1)
+        t_norm = F.normalize(teacher_feat, dim=1)
+        cos_sim = (s_norm * t_norm).sum(dim=1)  # (B, H, W)
+        cos_loss = 1.0 - cos_sim.mean()
+
+        return mse + self.cosine_weight * cos_loss
+
+
 class DistillationLoss(nn.Module):
     """Knowledge distillation loss from teacher soft targets.
 
@@ -378,7 +431,15 @@ class DistillationLoss(nn.Module):
 
 
 class CombinedLoss(nn.Module):
-    """Combined GT + Distillation loss: L = (1 - alpha) * L_gt + alpha * L_distill"""
+    """Combined GT + Distillation loss.
+
+    L = (1 - alpha) * L_gt + alpha * L_distill_response + beta * L_distill_feature
+
+    - alpha: weight of response-based (logits) distillation vs GT
+    - beta: weight of feature-based (intermediate representations) distillation
+    - When beta > 0 and model provides feat_proj + target has soft_feat,
+      feature distillation is added as an additional term.
+    """
 
     def __init__(
         self,
@@ -392,10 +453,16 @@ class CombinedLoss(nn.Module):
         type_class_weights: Optional[List[float]] = None,
         use_ftl_binary: bool = False,
         tissue_aux: bool = False,
+        feature_distill_enabled: bool = False,
+        beta: float = 1.0,
+        feature_loss_use_cosine: bool = True,
+        feature_loss_cosine_weight: float = 0.5,
     ):
         super().__init__()
         self.alpha = alpha
+        self.beta = beta
         self.distillation_enabled = distillation_enabled
+        self.feature_distill_enabled = feature_distill_enabled
         self.gt_loss = CellSegLoss(
             loss_weights,
             use_focal=use_focal,
@@ -408,6 +475,12 @@ class CombinedLoss(nn.Module):
         if distillation_enabled:
             self.distill_loss = DistillationLoss(temperature, head_weights)
 
+        if feature_distill_enabled:
+            self.feature_match_loss = FeatureMatchLoss(
+                use_cosine=feature_loss_use_cosine,
+                cosine_weight=feature_loss_cosine_weight,
+            )
+
     def forward(
         self,
         pred: Dict[str, torch.Tensor],
@@ -415,17 +488,30 @@ class CombinedLoss(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
-            pred: Student outputs
-            target: Dict containing both GT maps and (optionally) soft targets
+            pred: Student outputs (may include "feat_proj" if feature distill on)
+            target: GT maps + (optionally) soft_binary/soft_hv/soft_type + soft_feat
         """
         gt_losses = self.gt_loss(pred, target)
 
+        # Start with GT losses
+        all_losses = dict(gt_losses)
+        total = gt_losses["total"]
+
+        # Response-based distillation (logit matching)
         if self.distillation_enabled and "soft_binary" in target:
             distill_losses = self.distill_loss(pred, target)
-            total = (1 - self.alpha) * gt_losses["total"] + self.alpha * distill_losses["distill_total"]
+            total = (1 - self.alpha) * total + self.alpha * distill_losses["distill_total"]
+            all_losses.update(distill_losses)
 
-            all_losses = {**gt_losses, **distill_losses}
-            all_losses["total"] = total
-            return all_losses
+        # Feature-based distillation (intermediate representation matching)
+        if (
+            self.feature_distill_enabled
+            and "feat_proj" in pred
+            and "soft_feat" in target
+        ):
+            feat_loss = self.feature_match_loss(pred["feat_proj"], target["soft_feat"])
+            all_losses["distill_feature"] = feat_loss * self.beta
+            total = total + self.beta * feat_loss
 
-        return gt_losses
+        all_losses["total"] = total
+        return all_losses

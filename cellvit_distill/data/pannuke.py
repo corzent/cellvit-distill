@@ -47,6 +47,7 @@ class PanNukeDataset(Dataset):
         folds: List[int],
         transform: Optional[A.Compose] = None,
         soft_targets_dir: Optional[str] = None,
+        soft_features_dir: Optional[str] = None,
     ):
         """
         Args:
@@ -54,10 +55,15 @@ class PanNukeDataset(Dataset):
             folds: List of fold indices to load (1, 2, 3)
             transform: Albumentations transform pipeline
             soft_targets_dir: Directory with pre-computed teacher soft targets
+                (binary/hv/type logits) for response-based distillation.
+            soft_features_dir: Directory with pre-computed teacher dense features
+                (e.g., ViT-H tokens at 16x16) for feature-based distillation.
+                Loaded as "soft_feat" in sample dict.
         """
         self.data_dir = Path(data_dir)
         self.transform = transform
         self.soft_targets_dir = Path(soft_targets_dir) if soft_targets_dir else None
+        self.soft_features_dir = Path(soft_features_dir) if soft_features_dir else None
 
         # Load folds with memory-mapped access (avoids loading ~12GB per fold into RAM)
         self._mmap_images = []
@@ -236,6 +242,17 @@ class PanNukeDataset(Dataset):
                         "type": st["type"].astype(np.float32, copy=True),
                     }
 
+        # Load pre-computed teacher dense features (e.g., ViT-H tokens (1280, 16, 16)).
+        # These are channel-invariant under flips/rotations (unlike HV maps whose
+        # values have directional meaning), so we just spatially transform them.
+        soft_feat = None
+        if self.soft_features_dir is not None:
+            feat_path = self.soft_features_dir / f"{idx}.npz"
+            if feat_path.exists():
+                with np.load(feat_path) as f:
+                    # Stored in fp16 on disk; upcast to fp32 for training stability
+                    soft_feat = f["features"].astype(np.float32, copy=True)
+
         # Apply augmentations
         if self.transform is not None:
             # Convert image to uint8 for albumentations if needed
@@ -261,6 +278,58 @@ class PanNukeDataset(Dataset):
                     masks_list.append(soft_type[c].astype(np.float32))
                 # soft_hv excluded: flips require sign correction on distance values,
                 # and GT HV maps (recomputed from instance_map) are already exact.
+
+            # Features are lower-resolution (e.g., 16x16 vs 256x256 image). They
+            # can't share the exact mask pipeline, but flips/rot90 commute with
+            # downsampling — so we apply the same logical spatial op manually
+            # using Albumentations ReplayCompose-style. For simplicity we handle
+            # only the three deterministic spatial augmentations that affect
+            # feature alignment: HFlip, VFlip, RandomRotate90. Other augmentations
+            # (ColorJitter, Blur, etc.) don't affect feature maps.
+            # If feature distill is enabled, we need to know which spatial ops
+            # were actually applied. We use a pre-sampled RNG state approach:
+            # generate spatial flags here, apply them manually, then strip
+            # those spatial ops from the transform below.
+            apply_hflip = apply_vflip = False
+            apply_rot90_k = 0  # 0, 1, 2, or 3 for 90° rotations
+            if soft_feat is not None:
+                # Sample the spatial aug outcomes that Albumentations would sample.
+                # This matches probabilities in get_train_transform: p=0.5 each.
+                import random as _rnd
+                apply_hflip = _rnd.random() < 0.5
+                apply_vflip = _rnd.random() < 0.5
+                if _rnd.random() < 0.5:
+                    apply_rot90_k = _rnd.randint(0, 3)
+
+                # Apply to image_uint8 BEFORE passing to Albumentations (so the
+                # remaining pipeline only does non-spatial ops).
+                if apply_hflip:
+                    image_uint8 = image_uint8[:, ::-1, :].copy()
+                if apply_vflip:
+                    image_uint8 = image_uint8[::-1, :, :].copy()
+                if apply_rot90_k:
+                    image_uint8 = np.rot90(image_uint8, k=apply_rot90_k, axes=(0, 1)).copy()
+
+                # Same spatial ops for all masks in masks_list
+                new_masks_list = []
+                for m in masks_list:
+                    if apply_hflip:
+                        m = m[:, ::-1].copy()
+                    if apply_vflip:
+                        m = m[::-1, :].copy()
+                    if apply_rot90_k:
+                        m = np.rot90(m, k=apply_rot90_k, axes=(0, 1)).copy()
+                    new_masks_list.append(m)
+                masks_list = new_masks_list
+
+                # Same spatial ops for features (at their own resolution).
+                # Features shape: (C, H, W) — apply along last 2 axes.
+                if apply_hflip:
+                    soft_feat = soft_feat[:, :, ::-1].copy()
+                if apply_vflip:
+                    soft_feat = soft_feat[:, ::-1, :].copy()
+                if apply_rot90_k:
+                    soft_feat = np.rot90(soft_feat, k=apply_rot90_k, axes=(1, 2)).copy()
 
             # Transform image + all masks with same spatial ops
             transformed = self.transform(
@@ -322,10 +391,18 @@ class PanNukeDataset(Dataset):
             sample["soft_hv"] = torch.from_numpy(soft_data["hv"]).float()
             sample["soft_type"] = torch.from_numpy(soft_data["type"]).float()
 
+        # Add spatially-aligned teacher features (for feature distillation)
+        if soft_feat is not None:
+            sample["soft_feat"] = torch.from_numpy(soft_feat).float()
+
         return sample
 
 
-def get_train_transform(patch_size: int = 256, strong: bool = False) -> A.Compose:
+def get_train_transform(
+    patch_size: int = 256,
+    strong: bool = False,
+    skip_spatial: bool = False,
+) -> A.Compose:
     """Training augmentations for PanNuke.
 
     Args:
@@ -333,21 +410,30 @@ def get_train_transform(patch_size: int = 256, strong: bool = False) -> A.Compos
         strong: If True, adds elastic deformation, coarse dropout, and
                 heavier color jitter — helps combat overfitting on small
                 datasets like PanNuke (only ~5.2K training patches).
+        skip_spatial: If True, omits flip/rotate/elastic ops. Used when
+                those must be applied manually (e.g., to keep low-resolution
+                teacher features aligned with the image).
     """
-    transforms = [
-        A.HorizontalFlip(p=0.5),
-        A.VerticalFlip(p=0.5),
-        A.RandomRotate90(p=0.5),
-    ]
+    transforms = []
+    if not skip_spatial:
+        transforms += [
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.RandomRotate90(p=0.5),
+        ]
 
     if strong:
+        if not skip_spatial:
+            # Elastic + Affine are spatial; cannot be applied safely to
+            # low-resolution teacher features, so we omit them when those
+            # are present.
+            transforms += [
+                A.ElasticTransform(alpha=80, sigma=10, p=0.3),
+                A.Affine(translate_percent={"x": (-0.05, 0.05), "y": (-0.05, 0.05)},
+                         scale=(0.9, 1.1), rotate=(-15, 15),
+                         border_mode=0, p=0.4),
+            ]
         transforms += [
-            # Geometric: elastic deformation simulates tissue variability
-            A.ElasticTransform(alpha=80, sigma=10, p=0.3),
-            # Affine jitter (small scale + rotation)
-            A.Affine(translate_percent={"x": (-0.05, 0.05), "y": (-0.05, 0.05)},
-                     scale=(0.9, 1.1), rotate=(-15, 15),
-                     border_mode=0, p=0.4),
             # Stronger color jitter to simulate stain variation
             A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.08, p=0.6),
             A.GaussianBlur(blur_limit=(3, 5), p=0.3),

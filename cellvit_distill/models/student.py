@@ -122,11 +122,16 @@ class StudentCellViT(nn.Module):
         tissue_aux: bool = False,
         num_tissue_classes: int = 19,
         hv_tanh: bool = False,
+        feature_distill: bool = False,
+        teacher_feat_dim: int = 1280,
+        feature_distill_stage: int = 2,  # 0-indexed: 2 = third stage, usually 16x16 for 256x256 input
     ):
         super().__init__()
         self.encoder_name = encoder_name
         self.num_classes = num_classes
         self.tissue_aux = tissue_aux
+        self.feature_distill = feature_distill
+        self.feature_distill_stage = feature_distill_stage
 
         # Get encoder config
         if encoder_name not in self.ENCODER_CONFIGS:
@@ -187,6 +192,14 @@ class StudentCellViT(nn.Module):
         else:
             self.tissue_head = None
 
+        # Feature distillation projection: 1x1 conv mapping the selected
+        # encoder stage output channels to the teacher's token dimensionality.
+        if feature_distill:
+            src_ch = encoder_channels[feature_distill_stage]
+            self.feature_projector = nn.Conv2d(src_ch, teacher_feat_dim, kernel_size=1)
+        else:
+            self.feature_projector = None
+
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -215,6 +228,8 @@ class StudentCellViT(nn.Module):
         }
         if self.tissue_head is not None:
             out["tissue_logits"] = self.tissue_head(features[-1])
+        if self.feature_projector is not None:
+            out["feat_proj"] = self.feature_projector(features[self.feature_distill_stage])
         return out
 
     def count_parameters(self) -> Dict[str, int]:
@@ -248,4 +263,7 @@ def build_student(cfg: dict) -> StudentCellViT:
         tissue_aux=student_cfg.get("tissue_aux", False),
         num_tissue_classes=student_cfg.get("num_tissue_classes", 19),
         hv_tanh=student_cfg.get("hv_tanh", False),
+        feature_distill=student_cfg.get("feature_distill", False),
+        teacher_feat_dim=student_cfg.get("teacher_feat_dim", 1280),
+        feature_distill_stage=student_cfg.get("feature_distill_stage", 2),
     )

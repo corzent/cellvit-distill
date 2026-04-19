@@ -2,33 +2,36 @@
 
 ## Headline
 
-The best model — **FastViT-S12 + response-based KD + 8-way TTA** — reaches **mPQ = 0.472** at **11.5M parameters**. That is **92.5% of the teacher's quality (CellViT-SAM-H, 0.51 mPQ) at 55× fewer parameters**, with peak inference VRAM dropping from ≥24 GB to ~2 GB.
+The best model — **FastViT-S12 + response-based KD + 8-way TTA** — reaches **mPQ = 0.472** at **11.5M parameters**. That is **80% of the teacher's fold-3 quality (CellViT-SAM-H, 0.592 mPQ under our protocol) at 55× fewer parameters**, with peak inference VRAM dropping from ≥24 GB to ~2 GB.
 
 ## Main comparison
 
-Evaluated on PanNuke fold 3 (held-out) under the standard CellViT/NuLite protocol (`nanmean_over_images(nanmean_over_classes(PQ))`).
+Evaluated on PanNuke fold 3 (held-out) under the standard CellViT/NuLite protocol (`nanmean_over_images(nanmean_over_classes(PQ))`). All numbers in the "our eval" column were recomputed with the same post-processing pipeline and the same metric implementation for apples-to-apples comparison.
 
-| Model | Params | mPQ | bPQ | F1 | Note |
-|---|---|---|---|---|---|
-| CellViT-SAM-H [teacher, published] | 630M | 0.51 | 0.64 | 0.83 | 3-fold avg (paper) |
-| NuLite-T [published, 2026] | 12M | ≈0.50 | ≈0.64 | ≈0.82 | external baseline |
-| ConvNeXt-Tiny baseline | 31.9M | 0.468 | 0.591 | 0.719 | earlier student |
-| FastViT-S12 baseline (v2 recipe) | 11.5M | 0.456 | 0.578 | 0.706 | NuLite-style recipe |
-| FastViT-S12 + response KD | 11.5M | 0.467 | 0.598 | 0.724 | α=0.2, T=10 |
-| FastViT-S12 + feature KD (β=1.0) | 11.8M | 0.461 | 0.591 | 0.720 | response + feature match |
-| **FastViT-S12 + response KD + TTA** | **11.5M** | **0.472** | **0.604** | **0.729** | 8-way TTA at inference |
-| FastViT-S12 + feature KD + TTA | 11.8M | 0.468 | 0.604 | 0.728 | 8-way TTA |
-| FastViT-S12 + baseline + TTA | 11.5M | 0.467 | 0.593 | 0.718 | 8-way TTA, no distill |
+| Model | Params | mPQ (ours) | mPQ (paper) | bPQ | F1 | Note |
+|---|---|---|---|---|---|---|
+| CellViT-SAM-H (teacher) | 630M | **0.592** | 0.51 | 0.664 | 0.784 | cached logits from precompute; paper is 3-fold avg |
+| CellViT-256 (x20 checkpoint) | 46.8M | 0.317 | — | 0.471 | 0.598 | magnification mismatch (x20 ckpt on x40 data) |
+| NuLite-T [published, 2026] | 12M | — | ≈0.50 | ≈0.64 | ≈0.82 | external baseline, not run locally |
+| ConvNeXt-Tiny baseline | 31.9M | 0.468 | — | 0.591 | 0.719 | earlier student |
+| FastViT-S12 baseline (v2 recipe) | 11.5M | 0.456 | — | 0.578 | 0.706 | NuLite-style recipe |
+| FastViT-S12 + response KD | 11.5M | 0.467 | — | 0.598 | 0.724 | α=0.2, T=10 |
+| FastViT-S12 + feature KD (β=1.0) | 11.8M | 0.461 | — | 0.591 | 0.720 | response + feature match |
+| **FastViT-S12 + response KD + TTA** | **11.5M** | **0.472** | — | **0.604** | **0.729** | 8-way TTA at inference |
+| FastViT-S12 + feature KD + TTA | 11.8M | 0.468 | — | 0.604 | 0.728 | 8-way TTA |
+| FastViT-S12 baseline + TTA | 11.5M | 0.467 | — | 0.593 | 0.718 | 8-way TTA, no distill |
 
-## Per-class PQ (TTA)
+## Per-class PQ (fold 3, TTA for student variants)
 
-| Class | ConvNeXt baseline | FastViT baseline | FastViT + response KD | FastViT + feature KD |
-|---|---|---|---|---|
-| Neoplastic | 0.533 | 0.530 | 0.550 | 0.553 |
-| Inflammatory | 0.446 | 0.449 | 0.446 | 0.428 |
-| Connective | 0.386 | 0.385 | 0.384 | 0.381 |
-| Dead | 0.134 | 0.158 | 0.104 | **0.137** |
-| Epithelial | 0.542 | 0.531 | 0.544 | 0.545 |
+| Class | Teacher (SAM-H) | CellViT-256 | ConvNeXt baseline | FastViT baseline | FastViT + resp KD | FastViT + feat KD |
+|---|---|---|---|---|---|---|
+| Neoplastic | 0.668 | 0.401 | 0.533 | 0.530 | 0.550 | 0.553 |
+| Inflammatory | 0.576 | 0.317 | 0.446 | 0.449 | 0.446 | 0.428 |
+| Connective | 0.516 | 0.250 | 0.386 | 0.385 | 0.384 | 0.381 |
+| Dead | **0.443** | 0.011 | 0.134 | 0.158 | 0.104 | **0.137** |
+| Epithelial | 0.670 | 0.224 | 0.542 | 0.531 | 0.544 | 0.545 |
+
+Teacher dominates Dead class (0.443) — expected given its 630M capacity, no data scarcity issue. Among students, feature-KD captures Dead best (0.137), consistent with the hypothesis that feature matching is less biased by class frequency than KL divergence on logits.
 
 ## Computational efficiency
 

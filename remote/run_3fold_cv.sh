@@ -5,8 +5,10 @@
 # Writes a manifest of (condition, fold, run_dir) for the aggregator.
 # Idempotent: re-running skips (condition, fold) pairs already in the manifest.
 #
-# Estimated time on RTX 5090: ~2-2.5 h total (6 train runs × ~15-20 min + evals)
-# with BATCH_SIZE=32 below. Original config default was 8 (~4-5 h).
+# Estimated time on RTX 5090 with optimizations below: ~3-5 h total
+# (6 train runs + 12 evals). Hard to predict precisely until first run gives
+# real per-epoch tempo at batch 32 + 16 workers + val_every 5; original
+# config defaults would put this at 25-30 h, so we MUST tune.
 set -e
 set -o pipefail
 
@@ -32,6 +34,17 @@ OUTPUT_DIR=/workspace/cellvit-distill/cellvit_distill/runs
 # usage to ~12-16 GB and cuts wall-clock by ~4×. lr unchanged: AdamW with
 # 10-epoch warmup absorbs the 4× batch increase without retuning.
 BATCH_SIZE=32
+
+# vast.ai 5090 instance has 32 vCPU; config default num_workers=4 leaves
+# the data loader CPU-bound. Smoke test showed ~5 patches/sec on batch 8,
+# meaning GPU was ~90% idle waiting on data. Bumping to 16 workers.
+NUM_WORKERS=16
+
+# Validate every 5 epochs instead of every epoch. validate() runs the
+# expensive HoVer-watershed + linear_sum_assignment per image on CPU, so
+# val takes ~1/3 the time of train per epoch. early_stop_patience=20 in
+# epoch-units still works correctly (4 stagnant validations trigger stop).
+VAL_EVERY=5
 
 # Run one training + eval pass.
 # Args: condition_label, hold_out_fold, train_folds_yaml, config_path, extra_overrides...
@@ -63,6 +76,8 @@ run_one() {
             "data.train_folds=${train_folds}" \
             "data.val_fold=${hold_out}" \
             "training.batch_size=${BATCH_SIZE}" \
+            "data.num_workers=${NUM_WORKERS}" \
+            "training.val_every_n_epochs=${VAL_EVERY}" \
             "$@" \
         2>&1 | tee "$log"
 

@@ -139,16 +139,17 @@ def evaluate(model, dataloader, device, num_classes=5, tta=False, n_workers_post
                 all_gt_instances.append(gt_inst)
                 all_pred_types.append(pred_type)
                 all_gt_types.append(gt_type)
+        metrics = compute_all_metrics(
+            all_pred_instances, all_gt_instances,
+            all_pred_types, all_gt_types,
+            num_classes=num_classes,
+            pool=pool,
+        )
     finally:
         if pool is not None:
             pool.close()
             pool.join()
 
-    metrics = compute_all_metrics(
-        all_pred_instances, all_gt_instances,
-        all_pred_types, all_gt_types,
-        num_classes=num_classes,
-    )
     return metrics
 
 

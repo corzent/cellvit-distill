@@ -99,6 +99,13 @@ def panoptic_quality(
     return {"PQ": pq, "DQ": dq, "SQ": sq, "TP": tp, "FP": fp, "FN": fn}
 
 
+def _per_image_pq_dq(args):
+    """Module-level worker: panoptic_quality for one image, return (PQ, DQ)."""
+    pred, gt = args
+    result = panoptic_quality(pred, gt)
+    return result["PQ"], result["DQ"]
+
+
 def compute_binary_pq(
     pred_maps: List[np.ndarray],
     gt_maps: List[np.ndarray],
@@ -109,6 +116,48 @@ def compute_binary_pq(
         result = panoptic_quality(pred, gt)
         pqs.append(result["PQ"])
     return np.mean(pqs) if pqs else 0.0
+
+
+def _per_image_multi_class_pq(args):
+    """Module-level worker: per-image vector of (num_classes,) PQs (nan if absent)."""
+    pred_inst, gt_inst, pred_type, gt_type, num_classes = args
+    image_pqs = np.full(num_classes, np.nan, dtype=np.float64)
+
+    for cls_idx, cls in enumerate(range(1, num_classes + 1)):
+        pred_cls = np.zeros_like(pred_inst)
+        gt_cls = np.zeros_like(gt_inst)
+
+        for inst_id in np.unique(pred_inst):
+            if inst_id == 0:
+                continue
+            mask = pred_inst == inst_id
+            inst_type = pred_type[mask]
+            if len(inst_type) > 0:
+                majority_class = np.bincount(
+                    inst_type.astype(int), minlength=num_classes + 1
+                ).argmax()
+                if majority_class == cls:
+                    pred_cls[mask] = inst_id
+
+        for inst_id in np.unique(gt_inst):
+            if inst_id == 0:
+                continue
+            mask = gt_inst == inst_id
+            inst_type = gt_type[mask]
+            if len(inst_type) > 0:
+                majority_class = np.bincount(
+                    inst_type.astype(int), minlength=num_classes + 1
+                ).argmax()
+                if majority_class == cls:
+                    gt_cls[mask] = inst_id
+
+        if not np.any(gt_cls):
+            continue
+
+        result = panoptic_quality(pred_cls, gt_cls)
+        image_pqs[cls_idx] = result["PQ"]
+
+    return image_pqs
 
 
 def compute_multi_class_pq(
@@ -208,16 +257,47 @@ def compute_all_metrics(
     pred_type_maps: List[np.ndarray],
     gt_type_maps: List[np.ndarray],
     num_classes: int = 5,
+    pool=None,
 ) -> Dict[str, float]:
-    """Compute all evaluation metrics."""
-    bpq = compute_binary_pq(pred_maps, gt_maps)
-    mpq_results = compute_multi_class_pq(
-        pred_maps, gt_maps, pred_type_maps, gt_type_maps, num_classes
-    )
+    """Compute all evaluation metrics.
 
-    f1_scores = []
-    for pred, gt in zip(pred_maps, gt_maps):
-        f1_scores.append(f1_detection(pred, gt))
+    pool: optional multiprocessing Pool (e.g. from postprocess.make_postprocess_pool).
+        When provided, per-image PQ/DQ are computed in parallel — typically
+        saves several minutes on PanNuke val/test sets (2656 images, 5 classes,
+        each call does scipy linear_sum_assignment on CPU).
+    """
+    if pool is None:
+        bpq = compute_binary_pq(pred_maps, gt_maps)
+        mpq_results = compute_multi_class_pq(
+            pred_maps, gt_maps, pred_type_maps, gt_type_maps, num_classes
+        )
+        f1_scores = [f1_detection(pred, gt) for pred, gt in zip(pred_maps, gt_maps)]
+    else:
+        # Binary PQ + F1 share the same panoptic_quality call (DQ == F1_detection).
+        binary_args = list(zip(pred_maps, gt_maps))
+        pq_dq = pool.map(_per_image_pq_dq, binary_args)
+        binary_pqs, dqs = zip(*pq_dq) if pq_dq else ([], [])
+        bpq = float(np.mean(binary_pqs)) if binary_pqs else 0.0
+        f1_scores = list(dqs)
+
+        # Per-image per-class PQ
+        mc_args = [
+            (pred_inst, gt_inst, pred_type, gt_type, num_classes)
+            for pred_inst, gt_inst, pred_type, gt_type
+            in zip(pred_maps, gt_maps, pred_type_maps, gt_type_maps)
+        ]
+        per_image_class_pq = np.array(pool.map(_per_image_multi_class_pq, mc_args))
+        with np.errstate(invalid="ignore"):
+            per_image_mpq = np.nanmean(per_image_class_pq, axis=1)
+            mpq = np.nanmean(per_image_mpq)
+            per_class_mpq = np.nanmean(per_image_class_pq, axis=0)
+        mpq_results = {
+            "mPQ": float(mpq) if not np.isnan(mpq) else 0.0,
+            **{
+                f"PQ_class_{c}": float(per_class_mpq[i]) if not np.isnan(per_class_mpq[i]) else 0.0
+                for i, c in enumerate(range(1, num_classes + 1))
+            },
+        }
 
     return {
         "bPQ": bpq,

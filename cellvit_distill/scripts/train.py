@@ -218,19 +218,19 @@ def validate(
                 all_gt_instances.append(gt_inst)
                 all_pred_types.append(pred_type)
                 all_gt_types.append(gt_type)
+        avg_losses = {k: v / max(num_batches, 1) for k, v in epoch_losses.items()}
+
+        # Compute metrics — reuse the same pool that did post-process
+        metrics = compute_all_metrics(
+            all_pred_instances, all_gt_instances,
+            all_pred_types, all_gt_types,
+            num_classes=num_classes,
+            pool=pool,
+        )
     finally:
         if pool is not None:
             pool.close()
             pool.join()
-
-    avg_losses = {k: v / max(num_batches, 1) for k, v in epoch_losses.items()}
-
-    # Compute metrics
-    metrics = compute_all_metrics(
-        all_pred_instances, all_gt_instances,
-        all_pred_types, all_gt_types,
-        num_classes=num_classes,
-    )
 
     return {**avg_losses, **metrics}
 

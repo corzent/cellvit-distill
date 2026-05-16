@@ -63,7 +63,7 @@ cd datasets/pannuke
 for fold in 1 2 3; do
     if [ ! -f fold${fold}/images.npy ]; then
         echo "Downloading fold ${fold}..."
-        wget --show-progress https://nuke.warwick.ac.uk/static/files/fold_${fold}.zip
+        wget --show-progress https://warwick.ac.uk/fac/cross_fac/tia/data/pannuke/fold_${fold}.zip
         unzip -q fold_${fold}.zip
         mv "Fold ${fold}" fold${fold}
         rm fold_${fold}.zip

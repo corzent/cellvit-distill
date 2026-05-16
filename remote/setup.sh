@@ -44,6 +44,8 @@ else
     uv pip install -r requirements.txt
 fi
 uv pip install python-docx markitdown gdown
+# vendor/CellViT post-proc module imports numba; not in requirements.txt.
+uv pip install numba
 
 # Fail fast if torch can't see the GPU (driver/wheel mismatch surfaces here, not 30 min in).
 python -c "import torch; assert torch.cuda.is_available(), 'CUDA not visible to torch'; print('torch sees:', torch.cuda.get_device_name())"

@@ -5,7 +5,8 @@
 # Writes a manifest of (condition, fold, run_dir) for the aggregator.
 # Idempotent: re-running skips (condition, fold) pairs already in the manifest.
 #
-# Estimated time on RTX 5090: ~4-5 h total (6 train runs × ~40-50 min + evals).
+# Estimated time on RTX 5090: ~2-2.5 h total (6 train runs × ~15-20 min + evals)
+# with BATCH_SIZE=32 below. Original config default was 8 (~4-5 h).
 set -e
 set -o pipefail
 
@@ -25,6 +26,12 @@ DATA_DIR=/workspace/cellvit-distill/datasets/pannuke
 SOFT_TARGETS_DIR=/workspace/cellvit-distill/datasets/pannuke/soft_targets
 TEACHER_CKPT=/workspace/cellvit-distill/checkpoints/CellViT-SAM-H-x40.pth
 OUTPUT_DIR=/workspace/cellvit-distill/cellvit_distill/runs
+
+# 5090 has 32 GB VRAM; student is ~12M params. batch 8 (config default) uses
+# only ~3-4 GB and severely underutilizes the GPU. batch 32 brings VRAM
+# usage to ~12-16 GB and cuts wall-clock by ~4×. lr unchanged: AdamW with
+# 10-epoch warmup absorbs the 4× batch increase without retuning.
+BATCH_SIZE=32
 
 # Run one training + eval pass.
 # Args: condition_label, hold_out_fold, train_folds_yaml, config_path, extra_overrides...
@@ -55,6 +62,7 @@ run_one() {
             "logging.output_dir=${OUTPUT_DIR}" \
             "data.train_folds=${train_folds}" \
             "data.val_fold=${hold_out}" \
+            "training.batch_size=${BATCH_SIZE}" \
             "$@" \
         2>&1 | tee "$log"
 

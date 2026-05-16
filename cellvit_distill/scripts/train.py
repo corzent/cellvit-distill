@@ -35,7 +35,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from cellvit_distill.data.pannuke import PanNukeDataset, get_train_transform, get_val_transform
 from cellvit_distill.models.student import build_student
 from cellvit_distill.utils.losses import CombinedLoss
-from cellvit_distill.utils.postprocess import post_process_predictions
+from cellvit_distill.utils.postprocess import (
+    post_process_batch_parallel,
+    post_process_predictions,
+    make_postprocess_pool,
+)
 from cellvit_distill.utils.metrics import compute_all_metrics
 
 
@@ -157,8 +161,13 @@ def validate(
     criterion: CombinedLoss,
     device: torch.device,
     num_classes: int = 5,
+    n_workers_post: int = 32,
 ) -> dict:
-    """Validate: compute loss + PQ/F1 metrics."""
+    """Validate: compute loss + PQ/F1 metrics.
+
+    n_workers_post: size of multiprocessing pool for per-image post-processing.
+        0 disables parallelism.
+    """
     model.eval()
     epoch_losses = {}
     num_batches = 0
@@ -168,38 +177,51 @@ def validate(
     all_pred_types = []
     all_gt_types = []
 
-    for batch in loader:
-        images = batch["image"].to(device)
-        targets = {k: v.to(device) for k, v in batch.items() if k != "image"}
+    pool = make_postprocess_pool(n_workers_post) if n_workers_post > 0 else None
+    try:
+        for batch in loader:
+            images = batch["image"].to(device)
+            targets = {k: v.to(device) for k, v in batch.items() if k != "image"}
 
-        with autocast("cuda"):
-            outputs = model(images)
-            losses = criterion(outputs, targets)
+            with autocast("cuda"):
+                outputs = model(images)
+                losses = criterion(outputs, targets)
 
-        for k, v in losses.items():
-            if k not in epoch_losses:
-                epoch_losses[k] = 0.0
-            epoch_losses[k] += v.item()
-        num_batches += 1
+            for k, v in losses.items():
+                if k not in epoch_losses:
+                    epoch_losses[k] = 0.0
+                epoch_losses[k] += v.item()
+            num_batches += 1
 
-        # Post-process predictions for metric computation (cast to fp32 for scipy)
-        binary_pred = torch.softmax(outputs["binary"].float(), dim=1)[:, 1]  # nucleus prob
-        hv_pred = outputs["hv_map"].float()
-        type_pred = torch.softmax(outputs["type_map"].float(), dim=1)
+            # Post-process predictions for metric computation (cast to fp32 for scipy)
+            binary_pred = torch.softmax(outputs["binary"].float(), dim=1)[:, 1]  # nucleus prob
+            hv_pred = outputs["hv_map"].float()
+            type_pred = torch.softmax(outputs["type_map"].float(), dim=1)
 
-        for i in range(images.shape[0]):
-            pred_inst, pred_type = post_process_predictions(
-                binary_pred[i].cpu().numpy(),
-                hv_pred[i].cpu().numpy(),
-                type_pred[i].cpu().numpy(),
-            )
-            gt_inst = batch["instance_map"][i].numpy()
-            gt_type = batch["type_map"][i].argmax(dim=0).numpy()
+            binary_np = binary_pred.cpu().numpy()
+            hv_np = hv_pred.cpu().numpy()
+            type_np = type_pred.cpu().numpy()
 
-            all_pred_instances.append(pred_inst)
-            all_gt_instances.append(gt_inst)
-            all_pred_types.append(pred_type)
-            all_gt_types.append(gt_type)
+            if pool is not None:
+                results = post_process_batch_parallel(binary_np, hv_np, type_np, pool)
+            else:
+                results = [
+                    post_process_predictions(binary_np[i], hv_np[i], type_np[i])
+                    for i in range(images.shape[0])
+                ]
+
+            for i, (pred_inst, pred_type) in enumerate(results):
+                gt_inst = batch["instance_map"][i].numpy()
+                gt_type = batch["type_map"][i].argmax(dim=0).numpy()
+
+                all_pred_instances.append(pred_inst)
+                all_gt_instances.append(gt_inst)
+                all_pred_types.append(pred_type)
+                all_gt_types.append(gt_type)
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
 
     avg_losses = {k: v / max(num_batches, 1) for k, v in epoch_losses.items()}
 
@@ -387,6 +409,7 @@ def main():
             val_results = validate(
                 model, val_loader, criterion, device,
                 num_classes=cfg["data"]["num_classes"] - 1,
+                n_workers_post=cfg["data"].get("n_workers_post", 32),
             )
 
         elapsed = time.time() - t0

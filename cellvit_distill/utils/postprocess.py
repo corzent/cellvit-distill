@@ -7,11 +7,15 @@ Pipeline (following HoVer-Net):
 4. Assign cell type to each instance by majority vote from type_map
 """
 
+import multiprocessing as mp
+import multiprocessing.pool  # noqa: F401 — needed for mp.pool.Pool annotation
+import os
+from typing import List, Tuple
+
 import numpy as np
 from scipy.ndimage import label as scipy_label, binary_fill_holes
 from skimage.segmentation import watershed
 from skimage.feature import peak_local_max
-from typing import Tuple
 
 
 def _compute_hv_gradient(hv_map: np.ndarray) -> np.ndarray:
@@ -146,3 +150,52 @@ def post_process_predictions(
             type_map[mask] = majority
 
     return instance_map, type_map
+
+
+# ============================================================
+# Parallel batch post-processing
+# ============================================================
+
+def _process_one(args):
+    """Module-level worker for Pool.map — must be picklable."""
+    binary_prob, hv_map, type_probs = args
+    return post_process_predictions(binary_prob, hv_map, type_probs)
+
+
+def _worker_init():
+    """Pin each worker to a single OpenMP thread to avoid oversubscription
+    with the per-worker scipy/skimage internals."""
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+
+
+def make_postprocess_pool(n_workers: int) -> mp.pool.Pool:
+    """Create a multiprocessing Pool for parallel post-processing.
+
+    Uses the 'spawn' start method because the parent process has already
+    initialized CUDA contexts; forking after CUDA init can hang or crash
+    the children.
+    """
+    ctx = mp.get_context("spawn")
+    return ctx.Pool(processes=n_workers, initializer=_worker_init)
+
+
+def post_process_batch_parallel(
+    binary_batch: np.ndarray,
+    hv_batch: np.ndarray,
+    type_batch: np.ndarray,
+    pool: mp.pool.Pool,
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """Run post_process_predictions in parallel across the batch dim.
+
+    Args:
+        binary_batch: (B, H, W) fp32 nucleus probabilities
+        hv_batch: (B, 2, H, W) fp32 HV maps
+        type_batch: (B, C, H, W) fp32 per-class probabilities
+        pool: pool returned by make_postprocess_pool()
+
+    Returns: list of B (instance_map, type_map) tuples, in input order.
+    """
+    B = binary_batch.shape[0]
+    args = [(binary_batch[i], hv_batch[i], type_batch[i]) for i in range(B)]
+    return pool.map(_process_one, args)

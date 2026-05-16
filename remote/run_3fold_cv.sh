@@ -30,10 +30,13 @@ TEACHER_CKPT=/workspace/cellvit-distill/checkpoints/CellViT-SAM-H-x40.pth
 OUTPUT_DIR=/workspace/cellvit-distill/cellvit_distill/runs
 
 # 5090 has 32 GB VRAM; student is ~12M params. batch 8 (config default) uses
-# only ~3-4 GB and severely underutilizes the GPU. batch 32 brings VRAM
-# usage to ~12-16 GB and cuts wall-clock by ~4×. lr unchanged: AdamW with
-# 10-epoch warmup absorbs the 4× batch increase without retuning.
-BATCH_SIZE=32
+# only ~3-4 GB and severely underutilizes the GPU. batch 32 measured at
+# only ~5 GB VRAM during real training — plenty of headroom, bumped to 64.
+# Expected VRAM ~10 GB; another ~30% wall-clock cut on top of batch 32.
+# lr unchanged: AdamW with 10-epoch warmup absorbs the 8× batch increase
+# (vs config default) without retuning; first epochs of batch 32 run showed
+# clean loss descent.
+BATCH_SIZE=64
 
 # vast.ai 5090 instance has 32 vCPU; config default num_workers=4 leaves
 # the data loader CPU-bound. Smoke test showed ~5 patches/sec on batch 8,

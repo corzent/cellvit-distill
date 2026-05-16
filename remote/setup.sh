@@ -30,7 +30,10 @@ source .venv/bin/activate
 uv pip install -r requirements.txt
 # PyTorch with CUDA 12.4 for Blackwell support
 uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-uv pip install python-docx markitdown
+uv pip install python-docx markitdown gdown
+
+# Fail fast if torch can't see the GPU (driver/wheel mismatch surfaces here, not 30 min in).
+python -c "import torch; assert torch.cuda.is_available(), 'CUDA not visible to torch'; print('torch sees:', torch.cuda.get_device_name())"
 
 # ============ 5. Vendor CellViT (needs git lfs or zip from author repo) ============
 if [ ! -d vendor/CellViT ]; then
@@ -47,22 +50,26 @@ cd datasets/pannuke
 for fold in 1 2 3; do
     if [ ! -f fold${fold}/images.npy ]; then
         echo "Downloading fold ${fold}..."
-        wget -q https://nuke.warwick.ac.uk/static/files/fold_${fold}.zip
+        wget --show-progress https://nuke.warwick.ac.uk/static/files/fold_${fold}.zip
         unzip -q fold_${fold}.zip
-        mv "Fold ${fold}" fold${fold} 2>/dev/null || true
+        mv "Fold ${fold}" fold${fold}
         rm fold_${fold}.zip
     fi
 done
 cd ../..
 
 # ============ 7. Download teacher checkpoint ============
+# SAM-H weights live on the CellViT authors' Google Drive (see vendor/CellViT/README.md).
 mkdir -p checkpoints
 if [ ! -f checkpoints/CellViT-SAM-H-x40.pth ]; then
-    echo "Downloading CellViT-SAM-H checkpoint..."
-    # Via HF: requires login OR direct mirror if exists
-    # Replace with actual URL from CellViT repo releases
-    wget -q -O checkpoints/CellViT-SAM-H-x40.pth \
-        https://github.com/TIO-IKIM/CellViT/releases/download/v1.0/CellViT-SAM-H-x40.pth
+    echo "Downloading CellViT-SAM-H checkpoint via gdown..."
+    gdown --id 1MvRKNzDW2eHbQb5rAgTEp6s2zAXHixRV \
+        -O checkpoints/CellViT-SAM-H-x40.pth
+fi
+if [ "$(stat -c%s checkpoints/CellViT-SAM-H-x40.pth)" -lt 1000000000 ]; then
+    echo "ERROR: teacher checkpoint is <1 GB — download likely failed or returned an HTML error page." >&2
+    rm -f checkpoints/CellViT-SAM-H-x40.pth
+    exit 1
 fi
 
 # ============ 8. Precompute teacher outputs (on 5090, ~20 minutes total) ============
@@ -76,14 +83,8 @@ if [ ! -d datasets/pannuke/soft_targets ] || [ "$(ls datasets/pannuke/soft_targe
         --batch_size 8  # 5090 handles batch 8 in fp16 easily
 fi
 
-if [ ! -d datasets/pannuke/soft_features ] || [ "$(ls datasets/pannuke/soft_features | wc -l)" -lt 7000 ]; then
-    echo "Precomputing dense features..."
-    python -m cellvit_distill.scripts.precompute_features \
-        --data_dir datasets/pannuke \
-        --checkpoint checkpoints/CellViT-SAM-H-x40.pth \
-        --output_dir datasets/pannuke/soft_features \
-        --batch_size 8
-fi
+# Note: soft_features precompute is intentionally skipped — not needed for
+# baseline + response-KD 3-fold CV. Re-enable when running feature distillation.
 
 echo ""
 echo "============================================"
@@ -92,6 +93,4 @@ echo "============================================"
 echo ""
 echo "Next steps (run inside tmux to survive disconnect):"
 echo "  tmux new -s train"
-echo "  # then any of:"
 echo "  bash remote/run_3fold_cv.sh"
-echo "  bash remote/run_sam3_distill.sh"

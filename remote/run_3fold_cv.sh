@@ -1,18 +1,84 @@
 #!/bin/bash
-# 3-fold cross-validation on RTX 5090
-# Runs baseline + response KD for each of 3 PanNuke fold splits.
-# Estimated time on 5090: ~3-4 hours total (parallel batches × fold).
+# 3-fold cross-validation on RTX 5090.
+# For each PanNuke fold split: trains baseline and response-KD, then evaluates
+# each with and without 8-way TTA on the held-out fold.
+# Writes a manifest of (condition, fold, run_dir) for the aggregator.
+# Idempotent: re-running skips (condition, fold) pairs already in the manifest.
+#
+# Estimated time on RTX 5090: ~4-5 h total (6 train runs × ~40-50 min + evals).
 set -e
+set -o pipefail
 
 cd /workspace/cellvit-distill
 source .venv/bin/activate
 export PYTHONPATH="$(pwd)/vendor/CellViT:$PYTHONPATH"
 
 LOG_DIR=logs/3fold_cv
-mkdir -p $LOG_DIR
+mkdir -p "$LOG_DIR"
+MANIFEST="$LOG_DIR/runs.manifest"
+touch "$MANIFEST"  # do not truncate — supports resume
 
-# Each split: train on 2 folds, test on 1
-# Run baseline + distill pair for each split
+BASELINE_CFG=cellvit_distill/configs/fastvit_nulite_v2.yaml
+
+# Paths inside this container. Configs hard-code laptop paths; we override here.
+DATA_DIR=/workspace/cellvit-distill/datasets/pannuke
+SOFT_TARGETS_DIR=/workspace/cellvit-distill/datasets/pannuke/soft_targets
+TEACHER_CKPT=/workspace/cellvit-distill/checkpoints/CellViT-SAM-H-x40.pth
+OUTPUT_DIR=/workspace/cellvit-distill/cellvit_distill/runs
+
+# Run one training + eval pass.
+# Args: condition_label, hold_out_fold, train_folds_yaml, config_path, extra_overrides...
+run_one() {
+    local condition="$1"; shift
+    local hold_out="$1"; shift
+    local train_folds="$1"; shift
+    local config="$1"; shift
+
+    if grep -q "^${condition}	${hold_out}	" "$MANIFEST" 2>/dev/null; then
+        echo "[skip] ${condition}/fold${hold_out} already in manifest"
+        return
+    fi
+
+    local log="$LOG_DIR/${condition}_fold${hold_out}.log"
+
+    echo "============================================"
+    echo "[${condition}] hold out ${hold_out}, train on ${train_folds}"
+    echo "  log: $log"
+    echo "============================================"
+
+    python -m cellvit_distill.scripts.train \
+        --config "$config" \
+        --override \
+            "data.data_dir=${DATA_DIR}" \
+            "data.soft_targets_dir=${SOFT_TARGETS_DIR}" \
+            "teacher.checkpoint=${TEACHER_CKPT}" \
+            "logging.output_dir=${OUTPUT_DIR}" \
+            "data.train_folds=${train_folds}" \
+            "data.val_fold=${hold_out}" \
+            "$@" \
+        2>&1 | tee "$log"
+
+    # Extract run_dir from train.py's `Output: <path>` line.
+    # `|| true` so set -e doesn't kill us before our own error message runs.
+    local run_dir
+    run_dir=$(grep -m1 '^Output: ' "$log" | sed 's/^Output: //' || true)
+    if [ -z "$run_dir" ] || [ ! -d "$run_dir" ]; then
+        echo "ERROR: could not locate run_dir for ${condition}/fold${hold_out}" >&2
+        exit 1
+    fi
+    echo "  run_dir: $run_dir"
+
+    # Eval on held-out fold, both with and without TTA.
+    python -m cellvit_distill.scripts.eval_student \
+        --run_dir "$run_dir" --test_fold "$hold_out" \
+        2>&1 | tee -a "$log"
+    python -m cellvit_distill.scripts.eval_student \
+        --run_dir "$run_dir" --test_fold "$hold_out" --tta \
+        2>&1 | tee -a "$log"
+
+    printf '%s\t%s\t%s\n' "$condition" "$hold_out" "$run_dir" >> "$MANIFEST"
+}
+
 for HOLD_OUT in 1 2 3; do
     case $HOLD_OUT in
         1) TRAIN="[2, 3]" ;;
@@ -20,27 +86,12 @@ for HOLD_OUT in 1 2 3; do
         3) TRAIN="[1, 2]" ;;
     esac
 
-    echo "============================================"
-    echo "Split: hold out fold $HOLD_OUT, train on $TRAIN"
-    echo "============================================"
-
-    # Baseline (no distill)
-    python -m cellvit_distill.scripts.train \
-        --config cellvit_distill/configs/fastvit_nulite_v2.yaml \
-        --override "data.train_folds=$TRAIN" "data.val_fold=$HOLD_OUT" \
-        > $LOG_DIR/baseline_fold${HOLD_OUT}.log 2>&1
-
-    # Distill (response KD)
-    python -m cellvit_distill.scripts.train \
-        --config cellvit_distill/configs/fastvit_nulite_v2.yaml \
-        --override "data.train_folds=$TRAIN" "data.val_fold=$HOLD_OUT" \
-        "training.distillation.enabled=true" \
-        > $LOG_DIR/distill_fold${HOLD_OUT}.log 2>&1
+    run_one baseline      "$HOLD_OUT" "$TRAIN" "$BASELINE_CFG"
+    run_one distill_resp  "$HOLD_OUT" "$TRAIN" "$BASELINE_CFG" "training.distillation.enabled=true"
 done
 
-# After training, aggregate results
 echo "============================================"
 echo "Aggregating 3-fold results..."
 echo "============================================"
-python -m cellvit_distill.scripts.aggregate_3fold > $LOG_DIR/summary.txt
-cat $LOG_DIR/summary.txt
+python -m cellvit_distill.scripts.aggregate_3fold --manifest "$MANIFEST" \
+    | tee "$LOG_DIR/summary.md"

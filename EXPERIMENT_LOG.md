@@ -164,3 +164,100 @@ bash remote/run_3fold_cv.sh      # ~4-5 ч (6 train + 12 eval + aggregate)
 ### Результаты
 
 (Будут заполнены после завершения прогона.)
+
+---
+
+## 2026-05-16 — State of the art landscape для related work
+
+Литературный ресёрч проведён в день запуска 3-fold CV, чтобы
+ре-позиционировать вклад работы. Главный вывод: **наша архитектура
+структурно повторяет NuLite-T (concurrent work, 2024)**, поэтому
+утверждать архитектурную новизну нельзя. Реальный вклад работы —
+методологический: response-based KD от CellViT-SAM-H плюс две найденные
+методологические ошибки (spatial alignment, протокол mPQ). Этот раздел —
+сырьё для related work и для рефреймирования introduction.
+
+### Свежие модели для nuclei instance segmentation на PanNuke (2024–2026)
+
+| Модель | Год | Params | Encoder | Decoder | mPQ (PanNuke) | bPQ | Подход |
+|---|---|---|---|---|---|---|---|
+| CellViT-SAM-H | 2024 | 630M | ViT-H (SAM-pretrained) | 3 раздельных | 0.51 (paper) | 0.66 | Watershed на HV-maps; teacher |
+| CellViT-256 | 2024 | 46.8M | ViT-Tiny | 3 раздельных | — | 0.47 | Меньшая версия CellViT |
+| LKCell-L | 2024 | 163.8M | UniRepLKNet (large kernels) | 1 общий + 3 heads | **0.508** | **0.685** | Большие depth-wise kernels + parallel dilated |
+| LKCell-B | 2024 | 122.5M | UniRepLKNet-B | 1 общий + 3 heads | 0.503 | 0.681 | То же, меньшая версия |
+| HoVer-NeXt | 2024 | (не указано) | ConvNeXt | 2 раздельных | 0.477 (mPQ_tiss) | — | Быстрее CellViT в 5×, HoVer-Net в 17× |
+| NuLite-H | 2024 | 34.1M | FastViT-SA36 | 1 общий + 3 heads | 0.496 | 0.677 | Single-decoder без KD от teacher |
+| NuLite-M | 2024 | 24.1M | FastViT-SA24 | 1 общий + 3 heads | ≈0.49 | ≈0.67 | Same |
+| **NuLite-T** | 2024 | **12.05M** | **FastViT-S12** | 1 общий + 3 heads | ≈0.47–0.49 | ≈0.66 | **Structurally identical to ours** |
+| KongNet | 2025 | EfficientNetV2-L (118M+) | EffNetV2-L | **5 per-class** | F1=0.674 (mPQ не сообщён) | — | Per-class decoders, без watershed, centroid maxima |
+| CellViT++ | 2025 | foundation + lightweight head | замороженный ViT-FM | минимальный classifier | — (фокус на adapt cost) | — | Paradigm shift: train only the head |
+| **Наш FastViT-S12+resp KD** | 2026 | **11.5M** | FastViT-S12 | 1 общий + 3 heads (HoVer-Net style) | **0.472 (fold 3, +TTA)** | 0.604 | + response KD от CellViT-SAM-H |
+
+### Ключевые наблюдения для defense
+
+1. **NuLite-T — наш ближайший concurrent work.** Совпадает по encoder
+   (FastViT-S12), числу параметров (12.05M vs 11.5M), типу decoder
+   (single, U-Net-like с 3 головами) и dataset (PanNuke). Опубликован
+   август 2024 (arXiv 2408.01797, ScienceDirect 2025). **Главное
+   отличие**: NuLite обучается на GT с tissue-aware sampling, без
+   explicit KD от учителя. Наша работа добавляет именно distillation.
+
+2. **Recipe gap.** NuLite-T tренируется с **batch size 16**, **ExpLR
+   scheduler** (γ≈0.95). У нас batch 8, cosine. На FastViT-S12 batch 16
+   должен влезть в 32 GB VRAM (NuLite это тренирует — у них железо менее
+   мощное). Часть нашего gap'а до NuLite-H (0.472 vs 0.496) может быть
+   именно recipe-divergence.
+
+3. **LKCell — direction of future work, не для лёгкого сегмента.**
+   163M params при mPQ 0.508 — лучший абсолютный результат, но в 14×
+   тяжелее нашего бюджета. Их идея больших kernels в decoder может быть
+   адаптирована в наш 12M-бюджет (7×7 или 9×9 depth-wise convs вместо
+   3×3 ConvBNReLU) — это конкретный архитектурный tweak с
+   подтверждённым background'ом.
+
+4. **KongNet — direction для Dead-класса.** Per-class decoders дают
+   F1 0.59 на Dead (мы — 0.10–0.14). Их полный подход слишком тяжёл,
+   но **раздельная type-head с mini-decoder** — дешёвая адаптация
+   той же идеи.
+
+5. **HoVer-NeXt — direction для speed.** Two-decoder вместо трёх плюс
+   custom post-processing → ×5 ускорение vs CellViT. Не наша
+   первоочередная цель (мы уже ×7 быстрее по сравнению с teacher), но
+   для secondary deployment claim в дипломе полезный референс.
+
+6. **CellViT++ — paradigm shift, для будущей работы.** Frozen
+   foundation model + lightweight классификатор. Меняет всю постановку
+   distillation. Для бакалаврской работы не реалистично, но
+   *стоит упомянуть* в §Future Work как направление.
+
+### Рефреймирование contribution
+
+**Что НЕ contribution:**
+- Architecture itself (NuLite-T уже опубликована, наша почти идентична)
+- Использование FastViT-S12 (NuLite-T уже это сделали)
+- Single-decoder + 3 heads (стандарт для CellViT-семейства)
+
+**Что contribution:**
+- **Систематическое сравнение KD-парадигм** на одинаковой архитектуре:
+  no KD (baseline) / response KD / feature KD / response + TTA. Этого
+  comparative ablation **нет** в NuLite (они не тренируют с KD вообще)
+  и нет в CellViT (там teacher, не student).
+- **Два методологических исправления** (spatial alignment, mPQ
+  protocol — см. RESULTS.md §Two methodological findings), которые
+  превращают невоспроизводимые результаты в воспроизводимые.
+- **3-fold CV с проверкой статистической значимости** — почти ни одна
+  из cited работ это не делает (CellViT, NuLite репортуют single-fold
+  или не указывают).
+- **Reproducible distillation pipeline** для consumer GPU (16 GB) с
+  precomputed soft targets — есть код, есть фиксированный recipe.
+
+### Источники для библиографии
+
+- NuLite: Tommasino et al., arXiv 2408.01797 (2024), Biomedical
+  Signal Processing and Control (2025).
+- LKCell: arXiv 2407.18054 (2024). UniRepLKNet backbone.
+- KongNet: arXiv 2510.23559 (2025). Per-class decoders.
+- HoVer-NeXt: Baumann et al., PMLR v250 (MIDL 2024).
+- CellViT++: PubMed 41576779 (2025). Foundation models + lightweight.
+- HoVer-Net (baseline): Graham et al., Medical Image Analysis (2019).
+- CellViT (teacher): Hörst et al., Medical Image Analysis (2024).

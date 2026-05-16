@@ -1,7 +1,9 @@
 #!/bin/bash
-# Setup script for RTX 5090 vast.ai / RunPod instance
+# Setup script for RTX 5090 vast.ai / RunPod instance.
+# Idempotent: safe to re-run; skips work that is already done.
 # Run on remote: bash setup.sh
 set -e
+set -o pipefail
 
 # ============ 0. Sanity checks ============
 echo "== GPU =="
@@ -25,11 +27,22 @@ fi
 cd cellvit-distill
 
 # ============ 4. Python environment ============
-uv venv --python 3.13
+if [ ! -d .venv ]; then
+    uv venv --python 3.13
+fi
 source .venv/bin/activate
-uv pip install -r requirements.txt
-# PyTorch with CUDA 12.4 for Blackwell support
-uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+
+# Skip torch install if a working CUDA-enabled torch is already present
+# (e.g. pre-baked vast.ai/RunPod image). Installing again risks downgrading
+# the CUDA wheel and breaking the driver match.
+if ! python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+    uv pip install -r requirements.txt
+    # PyTorch with CUDA 12.4 for Blackwell support
+    uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+else
+    echo "Existing torch with CUDA detected — keeping it; only topping up project deps."
+    uv pip install -r requirements.txt
+fi
 uv pip install python-docx markitdown gdown
 
 # Fail fast if torch can't see the GPU (driver/wheel mismatch surfaces here, not 30 min in).

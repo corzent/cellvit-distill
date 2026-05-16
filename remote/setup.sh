@@ -67,6 +67,12 @@ for fold in 1 2 3; do
         unzip -q fold_${fold}.zip
         mv "Fold ${fold}" fold${fold}
         rm fold_${fold}.zip
+        # Warwick zip nests npy files: fold${N}/{images,masks}/fold${N}/{images,masks,types}.npy
+        # Code expects them at fold${N}/{images,masks,types}.npy — flatten.
+        mv fold${fold}/images/fold${fold}/images.npy fold${fold}/images.npy
+        mv fold${fold}/images/fold${fold}/types.npy  fold${fold}/types.npy
+        mv fold${fold}/masks/fold${fold}/masks.npy   fold${fold}/masks.npy
+        rm -rf fold${fold}/images fold${fold}/masks
     fi
 done
 cd ../..
@@ -76,7 +82,8 @@ cd ../..
 mkdir -p checkpoints
 if [ ! -f checkpoints/CellViT-SAM-H-x40.pth ]; then
     echo "Downloading CellViT-SAM-H checkpoint via gdown..."
-    gdown --id 1MvRKNzDW2eHbQb5rAgTEp6s2zAXHixRV \
+    # gdown >=5 dropped --id; pass the file id as a positional arg instead.
+    gdown 1MvRKNzDW2eHbQb5rAgTEp6s2zAXHixRV \
         -O checkpoints/CellViT-SAM-H-x40.pth
 fi
 if [ "$(stat -c%s checkpoints/CellViT-SAM-H-x40.pth)" -lt 1000000000 ]; then

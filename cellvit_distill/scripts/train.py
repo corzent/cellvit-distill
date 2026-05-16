@@ -287,12 +287,20 @@ def main():
             pin_memory=True,
             drop_last=True,
         )
+    # val_loader uses a smaller batch_size than train: per-image post-processing
+    # (HV-watershed + linear_sum_assignment) is CPU-bound and serial inside the
+    # loop, so big batches stall the GPU waiting for it. Empirically batch 8
+    # matches eval_student.py speed (~3 min for 2656 patches), vs 11 min at
+    # batch 64. persistent_workers avoids respawning the 16 workers on every
+    # validate() call inside the epoch loop.
+    val_batch_size = cfg["training"].get("val_batch_size", 8)
     val_loader = DataLoader(
         val_dataset,
-        batch_size=cfg["training"]["batch_size"],
+        batch_size=val_batch_size,
         shuffle=False,
         num_workers=cfg["data"]["num_workers"],
         pin_memory=True,
+        persistent_workers=cfg["data"]["num_workers"] > 0,
     )
 
     # --- Model ---

@@ -18,6 +18,9 @@ Usage:
 """
 
 import argparse
+import os
+import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -83,10 +86,32 @@ def compute_sample_weights(dataset: PanNukeDataset, num_classes: int = 5) -> np.
     return weights
 
 
+_ENV_VAR_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(?::-([^}]*))?\}")
+
+
+def _expand_env_in_strings(node):
+    """Recursively expand ${VAR} and ${VAR:-default} in any string in the tree."""
+    if isinstance(node, str):
+        def sub(m):
+            return os.environ.get(m.group(1), m.group(2) if m.group(2) is not None else m.group(0))
+        return _ENV_VAR_RE.sub(sub, node)
+    if isinstance(node, dict):
+        return {k: _expand_env_in_strings(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_expand_env_in_strings(v) for v in node]
+    return node
+
+
 def load_config(config_path: str, overrides: list = None) -> dict:
-    """Load YAML config with optional command-line overrides."""
+    """Load YAML config with optional command-line overrides.
+
+    Supports ${ENV_VAR} and ${ENV_VAR:-default} interpolation inside string
+    values so configs can be portable across machines without editing yaml.
+    """
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
+
+    cfg = _expand_env_in_strings(cfg)
 
     if overrides:
         for override in overrides:
@@ -103,6 +128,19 @@ def load_config(config_path: str, overrides: list = None) -> dict:
             d[keys[-1]] = value
 
     return cfg
+
+
+def set_seed(seed: int) -> None:
+    """Seed torch, numpy, and python random for run-to-run reproducibility.
+
+    Does not toggle cudnn.deterministic — that materially slows convolutions
+    and the project explicitly trades full determinism for speed.
+    """
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
 
 
 def train_one_epoch(
@@ -245,8 +283,10 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config, args.override)
+    seed = int(cfg["training"].get("seed", 42))
+    set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    print(f"Device: {device}, seed: {seed}")
 
     # --- Setup ---
     dist_cfg = cfg["training"]["distillation"]

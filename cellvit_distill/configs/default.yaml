@@ -3,8 +3,8 @@
 # --- Data ---
 data:
   dataset: pannuke
-  data_dir: /home/corzent/caspian/thesis/datasets/pannuke
-  soft_targets_dir: /home/corzent/caspian/thesis/datasets/pannuke/soft_targets
+  data_dir: ${CELLVIT_DATA_DIR:-./datasets/pannuke}
+  soft_targets_dir: ${CELLVIT_SOFT_TARGETS_DIR:-./datasets/pannuke/soft_targets}
   patch_size: 256
   num_classes: 6  # 5 cell types + background
   num_workers: 4
@@ -27,7 +27,7 @@ student:
 # --- Teacher Model ---
 teacher:
   name: cellvit_sam_h
-  checkpoint: /home/corzent/caspian/thesis/checkpoints/CellViT-SAM-H-x40.pth
+  checkpoint: ${CELLVIT_TEACHER_CKPT:-./checkpoints/CellViT-SAM-H-x40.pth}
   # Set to true to pre-compute soft targets (recommended for 16GB GPU)
   precompute_soft_targets: true
 
@@ -105,4 +105,4 @@ logging:
   wandb: true
   log_every_n_steps: 50
   save_checkpoint_every: 10
-  output_dir: /home/corzent/caspian/thesis/cellvit_distill/runs
+  output_dir: ${CELLVIT_OUTPUT_DIR:-./cellvit_distill/runs}

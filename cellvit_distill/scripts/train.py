@@ -114,11 +114,13 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     grad_clip: float = 1.0,
+    amp_dtype: torch.dtype = torch.float16,
 ) -> dict:
     """Train for one epoch."""
     model.train()
     epoch_losses = {}
     num_batches = 0
+    use_amp = amp_dtype != torch.float32
 
     for batch_idx, batch in enumerate(loader):
         # Move to device
@@ -127,7 +129,7 @@ def train_one_epoch(
 
         optimizer.zero_grad()
 
-        with autocast("cuda"):
+        with autocast("cuda", dtype=amp_dtype, enabled=use_amp):
             outputs = model(images)
             losses = criterion(outputs, targets)
 
@@ -162,6 +164,7 @@ def validate(
     device: torch.device,
     num_classes: int = 5,
     n_workers_post: int = 32,
+    amp_dtype: torch.dtype = torch.float16,
 ) -> dict:
     """Validate: compute loss + PQ/F1 metrics.
 
@@ -183,7 +186,7 @@ def validate(
             images = batch["image"].to(device)
             targets = {k: v.to(device) for k, v in batch.items() if k != "image"}
 
-            with autocast("cuda"):
+            with autocast("cuda", dtype=amp_dtype, enabled=amp_dtype != torch.float32):
                 outputs = model(images)
                 losses = criterion(outputs, targets)
 
@@ -385,7 +388,20 @@ def main():
         milestones=[warmup_epochs],
     )
 
-    scaler = GradScaler("cuda")
+    # Mixed-precision dtype: fp16 (default), bf16 (NaN-resistant; preferred for
+    # architectures that overflow under fp16 — e.g. NuLite's ConvTranspose
+    # decoder), or fp32 (no autocast). GradScaler is only meaningful for fp16.
+    _AMP_DTYPE_MAP = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }
+    amp_dtype_str = str(cfg["training"].get("amp_dtype", "fp16")).lower()
+    if amp_dtype_str not in _AMP_DTYPE_MAP:
+        raise ValueError(f"Unknown training.amp_dtype: {amp_dtype_str!r}")
+    amp_dtype = _AMP_DTYPE_MAP[amp_dtype_str]
+    print(f"Mixed precision: {amp_dtype_str}")
+    scaler = GradScaler("cuda", enabled=(amp_dtype == torch.float16))
 
     # --- Training Loop ---
     best_mpq = 0.0
@@ -399,6 +415,7 @@ def main():
         train_losses = train_one_epoch(
             model, train_loader, criterion, optimizer, scaler,
             device, epoch, cfg["training"]["grad_clip"],
+            amp_dtype=amp_dtype,
         )
 
         combined_scheduler.step()
@@ -410,6 +427,7 @@ def main():
                 model, val_loader, criterion, device,
                 num_classes=cfg["data"]["num_classes"] - 1,
                 n_workers_post=cfg["data"].get("n_workers_post", 32),
+                amp_dtype=amp_dtype,
             )
 
         elapsed = time.time() - t0

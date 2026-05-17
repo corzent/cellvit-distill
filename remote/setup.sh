@@ -99,11 +99,31 @@ fi
 export PYTHONPATH="$(pwd)/vendor/CellViT:$PYTHONPATH"
 if [ ! -d datasets/pannuke/soft_targets ] || [ "$(ls datasets/pannuke/soft_targets | wc -l)" -lt 7000 ]; then
     echo "Precomputing soft targets..."
+    # batch 32: prior run at batch 8 took ~50 min and used only ~4 GB
+    # of 32 GB VRAM; batch 32 ~3-4x faster, fits comfortably.
     python -m cellvit_distill.scripts.precompute_soft_targets \
         --data_dir datasets/pannuke \
         --checkpoint checkpoints/CellViT-SAM-H-x40.pth \
         --output_dir datasets/pannuke/soft_targets \
-        --batch_size 8  # 5090 handles batch 8 in fp16 easily
+        --batch_size 32
+fi
+
+# ============ 9. (Optional) NuLite-T released weights for Hybrid A eval ============
+# Set DOWNLOAD_NULITE=1 to also fetch NuLite-T weights from Zenodo (~48 MB).
+# Used by cellvit_distill.scripts.eval_nulite to reproduce Hybrid A comparison.
+if [ "${DOWNLOAD_NULITE:-0}" = "1" ]; then
+    mkdir -p vendor/nulite_checkpoints
+    if [ ! -f vendor/nulite_checkpoints/NuLite-T-Weights.pth ]; then
+        echo "Downloading NuLite-T weights from Zenodo..."
+        wget --show-progress \
+            "https://zenodo.org/records/13272655/files/NuLite-T-Weights.pth?download=1" \
+            -O vendor/nulite_checkpoints/NuLite-T-Weights.pth
+    fi
+    # Clone NuLite repo so its model class is importable
+    if [ ! -d vendor/NuLite ]; then
+        git clone --depth 1 https://github.com/CosmoIknosLab/NuLite.git vendor/NuLite
+    fi
+    uv pip install torchinfo  # only NuLite needs it
 fi
 
 # Note: soft_features precompute is intentionally skipped — not needed for

@@ -17,6 +17,9 @@ vendor/
 # Training outputs (weights, logs)
 cellvit_distill/runs/
 logs/smoke_*/
+logs/ufd_*/
+logs/mamba_*/
+logs/sweep_*/
 .hf_home*/
 *.log
 

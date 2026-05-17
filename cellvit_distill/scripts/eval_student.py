@@ -144,6 +144,7 @@ def evaluate(model, dataloader, device, num_classes=5, tta=False, n_workers_post
             all_pred_types, all_gt_types,
             num_classes=num_classes,
             pool=pool,
+            return_per_image=True,
         )
     finally:
         if pool is not None:
@@ -216,13 +217,18 @@ def main():
             name = PanNukeDataset.CLASS_NAMES[c]
             print(f"  PQ {name}: {metrics[key]:.4f}")
 
-    # Save results
+    # Save results — split scalars (json) from per-image arrays (npz).
     import json
     tta_suffix = "_tta" if args.tta else ""
+    per_image = {k: metrics.pop(k) for k in list(metrics.keys()) if k.startswith("_per_image_")}
     results_path = run_dir / f"eval_fold{args.test_fold}{tta_suffix}.json"
     with open(results_path, "w") as f:
         json.dump(metrics, f, indent=2)
     print(f"\nResults saved to: {results_path}")
+    if per_image:
+        npz_path = run_dir / f"eval_fold{args.test_fold}{tta_suffix}_per_image.npz"
+        np.savez_compressed(npz_path, **{k.removeprefix("_per_image_"): v for k, v in per_image.items()})
+        print(f"Per-image arrays:  {npz_path}")
 
 
 if __name__ == "__main__":

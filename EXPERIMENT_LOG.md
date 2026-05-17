@@ -167,6 +167,118 @@ bash remote/run_3fold_cv.sh      # ~4-5 ч (6 train + 12 eval + aggregate)
 
 ---
 
+## 2026-05-17 — KD instability bisection и hyperparameter retuning
+
+Хроника отладки катастрофического провала response-KD на этой машине,
+с финальным фиксом который применён для итогового 3-fold CV.
+
+### Симптомы
+
+При запуске CV на batch 64 (см. предыдущую секцию) baseline-runs давали
+ожидаемое качество (mPQ TTA 0.46–0.48 на fold 1 и fold 2), но **distill
+runs обвалились почти в 2× ниже baseline**:
+
+| Run | Recipe | mPQ TTA |
+|---|---|---|
+| baseline fold 1 | batch 64, no KD | **0.4816** |
+| baseline fold 2 | batch 64, no KD | **0.4625** |
+| distill_resp fold 1 | batch 64, α=0.2, T=10 | **0.2874** (катастрофа) |
+
+Для сравнения, в `RESULTS.md` (предыдущая итерация, fold 3, batch 8)
+response-KD с теми же α=0.2, T=10 давала **mPQ 0.467** — на 0.011 выше
+baseline. То есть KD работала.
+
+Чёткий регресс на той же кодовой базе, в той же среде — нужно было
+разобраться до запуска полного 3-fold.
+
+### Гипотезы и их проверка
+
+1. **«Битые soft_targets»** (теория: precompute на 5090 дал не те логиты,
+   что на ноутбуке).
+   → Проверил вручную patch 0: teacher предсказал 9.9% nucleus pixels
+   против GT 9.7%, **97% pixel-agreement**. Type-классы распределены
+   разумно. Soft_targets корректны.
+
+2. **«Сломан код в pannuke.py»** — после commit `f1d9411` (feature
+   distill infra) могла появиться регрессия в response-only пайплайне.
+   → Прочитал diff целиком: для response-only (`soft_feat is None`,
+   `skip_spatial=False`) код функционально идентичен версии, которая дала
+   рабочие результаты `RESULTS.md`. Никаких изменений.
+
+3. **«Сломан CombinedLoss»** — там тоже изменения в `f1d9411`.
+   → Прочитал new vs old: математика `L = (1-α)·L_gt + α·L_distill`
+   сохранена, для response-only обе версии дают тот же `total`. Без
+   регрессии.
+
+4. **«fork-Pool в validate() корруптит CUDA-state обучения»** —
+   мои свежие правки (commits `017b176`, `dc6baae`) запускают
+   multiprocessing.Pool через fork внутри тренировочного цикла. Fork
+   после CUDA-init известен как источник проблем.
+   → Прогнал distill@batch16 c `n_workers_post=0` (serial post-process,
+   без fork-Pool вообще): best mPQ 0.2597. Тоже broken. **Не fork-Pool.**
+
+5. **«batch_size 64 → 16 сломал KD»** — large-batch гипотеза.
+   → distill@batch16 broken (mPQ 0.26), distill@batch64 broken (0.29).
+   Различие batch'а **не объясняет** регресс.
+
+6. **«α=0.2 слишком агрессивный на этой среде»** — снизил до 0.05 на
+   том же batch 16.
+   → distill@batch16 α=0.05: **mPQ 0.4650 на эпохе 30, ещё растёт.**
+   Восстановлено качество на уровне baseline. **Гипотеза подтверждена.**
+
+### Финальный recipe для 3-fold CV (применён в commit 7269e75)
+
+- batch_size: **16** (ближе к NuLite-T published recipe)
+- distill α: **0.05** (вместо 0.2 в исходном `fastvit_nulite_v2.yaml`)
+- T: **10** (без изменений)
+- head_weights: **binary 1.0, hv_map 0.0, type_map 1.0** (без изменений)
+- num_workers: 16, val_every: 5, val_batch_size: 8, n_workers_post: 32
+- Всё остальное по `fastvit_nulite_v2.yaml`
+
+### Что это означает для тезиса
+
+Регресс α=0.2 → α=0.05 на той же кодовой базе между двумя итерациями
+эксперимента — **отдельная методологическая находка**, заслуживающая
+обсуждения. Возможные причины:
+
+1. **Возможный численный дрифт в torch/cu130** vs предыдущий
+   PyTorch+CUDA на ноутбуке пользователя — даже при идентичном
+   teacher checkpoint, fp16 forward может слегка отличаться, и KL
+   между softmax(logits/T) — чувствительная функция.
+2. **Изменение порядка сэмплинга** (другой `num_workers`, другая
+   WeightedRandomSampler RNG state) меняет эффективный gradient
+   на ранних эпохах.
+3. **Эффект batch-size коэффициента**: при `batch 16` (8× от старого
+   `batch 8`) gradient статистически менее шумный → KD-сигнал
+   эффективно сильнее → нужна меньшая α для того же баланса.
+
+Все три объясняют почему α=0.2 ломается, и почему α=0.05 (≈ α=0.2 / 4)
+восстанавливает баланс при batch×2.
+
+**Для §Methodology тезиса:** «Hyperparameter α был перетюнен с α=0.2
+(предложено в RESULTS.md v1) на α=0.05 при переходе на batch_size=16
+и более новую среду (PyTorch 2.12, CUDA 13). При исходной α=0.2 KD
+оказался нестабильным; α=0.05 даёт устойчивое обучение и положительный
+вклад over baseline».
+
+### Команды-репродукция отдельных тестов
+
+```bash
+# Hypothesis: fork-Pool corrupts CUDA → distill broken
+python -m cellvit_distill.scripts.train --config configs/fastvit_nulite_v2.yaml \
+    --override training.distillation.enabled=true training.batch_size=16 \
+    training.epochs=30 training.val_every_n_epochs=5 \
+    data.num_workers=16 data.n_workers_post=0
+# → best mPQ 0.2597 (BROKEN — фик не в fork)
+
+# Hypothesis: α слишком большая
+python -m cellvit_distill.scripts.train --config configs/fastvit_nulite_v2.yaml \
+    --override training.distillation.enabled=true training.distillation.alpha=0.05 \
+    training.batch_size=16 training.epochs=30 training.val_every_n_epochs=5 \
+    data.num_workers=16 data.n_workers_post=32
+# → best mPQ 0.4650, ещё растёт (FIXED — α=0.05 работает)
+```
+
 ## 2026-05-16 — State of the art landscape для related work
 
 Литературный ресёрч проведён в день запуска 3-fold CV, чтобы

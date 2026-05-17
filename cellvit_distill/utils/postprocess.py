@@ -172,11 +172,14 @@ def _worker_init():
 def make_postprocess_pool(n_workers: int) -> mp.pool.Pool:
     """Create a multiprocessing Pool for parallel post-processing.
 
-    Uses the 'spawn' start method because the parent process has already
-    initialized CUDA contexts; forking after CUDA init can hang or crash
-    the children.
+    Uses 'fork' start method. The CUDA-after-fork warning only matters
+    if workers TOUCH CUDA — they don't (pure scipy/skimage/numpy here).
+    Spawn was tried first but hangs reliably when the parent already
+    has torch + CUDA + tqdm + many open fds; workers never get past
+    bootstrap. Fork starts in <100 ms total and avoids the bootstrap
+    cost of re-importing torch (~5 s per worker).
     """
-    ctx = mp.get_context("spawn")
+    ctx = mp.get_context("fork")
     return ctx.Pool(processes=n_workers, initializer=_worker_init)
 
 

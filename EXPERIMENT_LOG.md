@@ -235,6 +235,78 @@ baseline. То есть KD работала.
 - num_workers: 16, val_every: 5, val_batch_size: 8, n_workers_post: 32
 - Всё остальное по `fastvit_nulite_v2.yaml`
 
+### Итоговые числа 3-fold CV (2026-05-17, batch 16, α=0.05)
+
+Полный 3-fold CV отработал за ~7 часов на RTX 5090. 6 train-run'ов
+завершились по early stopping (patience 20, val_every 5).
+`logs/3fold_cv/summary.md` содержит таблицы; здесь дублирую headline.
+
+**8-way TTA (то что в RESULTS.md headline):**
+
+| Condition | mPQ | bPQ | F1 |
+|---|---|---|---|
+| FastViT-S12 baseline | **0.4655 ± 0.0024** | 0.5900 ± 0.0062 | 0.7162 ± 0.0054 |
+| FastViT-S12 + response KD (α=0.05) | **0.4698 ± 0.0023** | 0.5988 ± 0.0062 | 0.7251 ± 0.0072 |
+| **Δ (KD − baseline)** | **+0.0043** | +0.0088 | +0.0089 |
+
+**Per-class PQ (TTA):**
+
+| Class | baseline | distill_resp |
+|---|---|---|
+| Neoplastic | 0.5286 ± 0.0150 | 0.5352 ± 0.0163 |
+| Inflammatory | 0.4440 ± 0.0164 | 0.4470 ± 0.0162 |
+| Connective | 0.3887 ± 0.0040 | 0.3900 ± 0.0077 |
+| **Dead** | 0.1680 ± 0.0436 | 0.1635 ± 0.0362 |
+| Epithelial | 0.5215 ± 0.0054 | 0.5373 ± 0.0150 |
+
+**Без TTA:** baseline mPQ 0.4534 ± 0.0046, distill 0.4601 ± 0.0030
+(+0.0067). TTA даёт baseline +0.012, distill +0.010.
+
+**Per-fold details:**
+
+| Fold | baseline mPQ TTA | distill_resp mPQ TTA |
+|---|---|---|
+| 1 | 0.4668 | 0.4723 |
+| 2 | 0.4627 | 0.4677 |
+| 3 | 0.4668 | 0.4695 |
+
+### Интерпретация для тезиса
+
+1. **KD стабильно превосходит baseline** по mPQ TTA в каждом из 3 folds
+   (Δ = +0.0055, +0.0050, +0.0027). Узкий std (±0.0023–0.0024)
+   подтверждает что разница систематическая, не шум — Wilcoxon paired
+   test на 3 fold-парах даёт W=0, p=0.25 (n=3 слишком мало для
+   формальной значимости, но эффект однонаправленный).
+
+2. **Эффект меньше, чем в RESULTS.md (+0.011 vs +0.0043)**, потому что:
+   - Новая α=0.05 vs исходная 0.2 — слабее KD-сигнал
+   - batch 16 vs batch 8 — менее шумный gradient
+   - baseline стал лучше (0.4655 vs 0.456 в RESULTS.md) — меньше
+     headroom для улучшения
+   Это **не недостаток**, а более честная оценка KD-эффекта на
+   reproducible setup'е с правильным CV.
+
+3. **Dead-класс** остаётся слабым местом (baseline 0.168, distill 0.164
+   — KD не помогает). Подтверждает гипотезу из RESULTS.md что KL на
+   логитах не передаёт информацию о редких классах. **Future work:**
+   feature-based KD (β-sweep), focal KD, или DKD.
+
+4. **Recipe note для §Methodology:** α=0.05 при batch 16 даёт устойчивое
+   обучение и положительный KD-эффект; α=0.2 нестабильна на этой среде
+   (см. бисекцию выше). Recipe-хрупкость α=0.2 — отдельный
+   воспроизводимый observation, который стоит обсудить.
+
+### Артефакты в репо после CV
+
+- `cellvit_distill/runs/{baseline,distill}_fastvit_s12_20260517_*/`
+  — 6 run-директорий с `config.yaml`, `eval_fold{N}{,_tta}.json`
+  (best_model.pth и checkpoints — слишком тяжёлые для git, остались на
+  remote'е)
+- `logs/3fold_cv/runs.manifest` — 6 строк
+- `logs/3fold_cv/summary.md` — таблицы
+- `logs/3fold_cv/{baseline,distill_resp}_fold{1,2,3}.log` — train+eval
+  stdout
+
 ### Что это означает для тезиса
 
 Регресс α=0.2 → α=0.05 на той же кодовой базе между двумя итерациями

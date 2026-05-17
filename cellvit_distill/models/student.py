@@ -252,11 +252,28 @@ class StudentCellViT(nn.Module):
         }
 
 
-def build_student(cfg: dict) -> StudentCellViT:
-    """Build student model from config dict."""
+def build_student(cfg: dict):
+    """Build student model from config dict.
+
+    Encoders starting with "nulite_" build NuLiteStudent (vendor/NuLite
+    wrapped to our train interface). Other encoders use StudentCellViT
+    (our HoVer-Net-style decoder with timm backbones).
+    """
     student_cfg = cfg["student"]
+    encoder_name = student_cfg["encoder"]
+
+    if encoder_name.startswith("nulite_"):
+        from cellvit_distill.models.nulite_student import NuLiteStudent
+        return NuLiteStudent(
+            encoder_name=encoder_name,
+            num_classes=student_cfg["heads"]["type_map"],
+            num_tissue_classes=student_cfg.get("num_tissue_classes", 19),
+            drop_rate=student_cfg.get("drop_rate", 0.0),
+            tissue_aux=student_cfg.get("tissue_aux", True),
+        )
+
     return StudentCellViT(
-        encoder_name=student_cfg["encoder"],
+        encoder_name=encoder_name,
         pretrained=student_cfg["encoder_pretrained"],
         decoder_channels=student_cfg["decoder_channels"],
         num_classes=student_cfg["heads"]["type_map"],

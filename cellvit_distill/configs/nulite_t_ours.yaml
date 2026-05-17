@@ -1,0 +1,109 @@
+# NuLite-T architecture wrapped into our training pipeline.
+# Goal: train NuLite-T (12.05M, FastViT-S12 encoder + their decoder
+# arrangement) under our 3-fold protocol and recipe so we can quantify
+# pure architecture difference vs our FastViT-S12 + HoVer-Net decoder.
+
+# --- Data ---
+data:
+  dataset: pannuke
+  data_dir: /home/corzent/caspian/thesis/datasets/pannuke
+  soft_targets_dir: /home/corzent/caspian/thesis/datasets/pannuke/soft_targets
+  patch_size: 256
+  num_classes: 6
+  num_workers: 4
+  train_folds: [1, 2]
+  val_fold: 3
+
+# --- Student Model: NuLite wrapper ---
+# encoder=nulite_fastvit_s12 routes build_student() to NuLiteStudent
+# which wraps vendor/NuLite/models/nulite.NuLite. Settings unrelated to
+# the NuLite architecture (decoder_channels, hv_tanh, feature_distill)
+# are ignored by the wrapper.
+student:
+  encoder: nulite_fastvit_s12      # NuLite-T (12.05M)
+  encoder_pretrained: true         # ignored — NuLite builds its own encoder
+  decoder_channels: [256, 128, 64, 32]  # ignored
+  heads:
+    binary: 2
+    hv_map: 2
+    type_map: 6
+  tissue_aux: true
+  num_tissue_classes: 19
+  hv_tanh: false                   # NuLite does not use tanh on HV
+  drop_rate: 0.0
+
+# --- Teacher Model ---
+teacher:
+  name: cellvit_sam_h
+  checkpoint: /home/corzent/caspian/thesis/checkpoints/CellViT-SAM-H-x40.pth
+  precompute_soft_targets: true
+
+# --- Training — identical to our fastvit_nulite_v2.yaml recipe ---
+training:
+  epochs: 130
+  batch_size: 8
+  optimizer: adamw
+  lr: 3.0e-4
+  weight_decay: 1.0e-5
+  adamw_betas: [0.85, 0.95]
+  scheduler: cosine
+  warmup_epochs: 10
+  grad_clip: 1.0
+  mixed_precision: true
+
+  val_every_n_epochs: 1
+  early_stop_patience: 20
+
+  class_balanced_sampling: true
+  use_ftl_binary: true
+
+  loss_weights:
+    binary_ce: 1.0
+    binary_dice: 1.0
+    hv_mse: 2.0
+    hv_msge: 8.0
+    type_ce: 1.0
+    type_dice: 1.0
+    tissue_ce: 0.1
+
+  use_focal: true
+  focal_gamma: 2.0
+  type_class_weights: [0.5, 1.0, 4.88, 3.04, 50.0, 3.5]
+
+  distillation:
+    enabled: false
+    alpha: 0.05                   # for parity with our recipe if KD enabled
+    temperature: 10.0
+    loss_type: kl_div
+    head_weights:
+      binary: 1.0
+      hv_map: 0.0
+      type_map: 1.0
+
+# --- Augmentation ---
+augmentation:
+  strong: true
+  horizontal_flip: true
+  vertical_flip: true
+  random_rotate90: true
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.2
+    hue: 0.08
+  gaussian_blur:
+    prob: 0.3
+    kernel_size: 3
+  stain_normalize: false
+
+evaluation:
+  metrics: [mPQ, bPQ, F1_detection]
+  iou_threshold: 0.5
+  save_predictions: true
+
+logging:
+  project: cellvit-distillation
+  wandb: false
+  log_every_n_steps: 50
+  save_checkpoint_every: 10
+  output_dir: /home/corzent/caspian/thesis/cellvit_distill/runs

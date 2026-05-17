@@ -32,3 +32,7 @@ Thumbs.db
 
 # uv lock (optional — can track if you want reproducible deps)
 # uv.lock
+
+# NuLite-baseline branch artifacts
+vendor/nulite_checkpoints/
+vendor/NuLite/

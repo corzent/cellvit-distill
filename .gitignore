@@ -16,6 +16,8 @@ vendor/
 
 # Training outputs (weights, logs)
 cellvit_distill/runs/
+logs/smoke_*/
+.hf_home*/
 *.log
 
 # Notebook outputs & checkpoints

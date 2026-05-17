@@ -6,8 +6,10 @@ Ground truth losses (HoVer-Net style):
     - Type: CE + Dice (with class weights and optional focal loss)
 
 Distillation losses:
-    - KL divergence on softened logits (binary, type heads)
-    - MSE on HV map regression outputs
+    - KL divergence on softened logits (binary, type heads)         [loss_type="kl_div"]
+    - Frequency-Decoupled KD on softmax maps (binary, type)         [loss_type="ufd_kd"]
+    - MSE on HV map regression outputs (always)
+    - Feature matching on intermediate teacher tokens (optional)
 """
 
 import torch
@@ -358,6 +360,134 @@ class FeatureMatchLoss(nn.Module):
         return mse + self.cosine_weight * cos_loss
 
 
+class FrequencyDecoupledDistillLoss(nn.Module):
+    """Frequency-decoupled KD for dense predictions (adapted from UFD-KD, BMVC 2025).
+
+    Standard per-pixel KL on segmentation logits averages over all pixels,
+    diluting rare/small-object signal (e.g. Dead nuclei occupy <2% of pixels
+    so their KL contribution is dwarfed by background). High-frequency
+    components of the softmax map carry most of the rare-class and boundary
+    information; low-frequency components carry the global class layout.
+
+    Pipeline:
+      1. Convert student/teacher logits to softmax with temperature T.
+      2. Apply 2D DCT-II across the (H, W) spatial axes for each (B, C).
+      3. Split DCT coefficients into LF block (top-left K_lf × K_lf) and HF
+         residual (everything else).
+      4. Weighted MSE in DCT domain:
+         L = w_lf * MSE(s_lf, t_lf) + w_hf * MSE(s_hf, t_hf).
+      5. Scale by T² (KD convention) and return a scalar.
+
+    Args:
+        temperature: KD softmax temperature.
+        lf_size: Side length of the LF block to keep (e.g. 32 for a 256x256
+            map keeps DC + the 32x32 lowest-frequency components). Clamped
+            to min(H, W) at runtime if a head's spatial size is smaller.
+        lf_weight: Multiplier on the LF-band MSE.
+        hf_weight: Multiplier on the HF-band MSE. For rare-class focus set
+            hf_weight > lf_weight (HF carries small-object information).
+        debug_steps: If >0, print raw (pre-T²) lf/hf magnitudes for that many
+            forward calls. Helps calibrate alpha vs the kl_div baseline.
+
+    Debug attributes (populated after each forward):
+        last_lf_raw, last_hf_raw — Python floats, pre-T² band losses.
+        last_total_raw           — w_lf*lf + w_hf*hf, pre-T².
+    """
+
+    def __init__(
+        self,
+        temperature: float = 10.0,
+        lf_size: int = 32,
+        lf_weight: float = 1.0,
+        hf_weight: float = 3.0,
+        debug_steps: int = 0,
+    ):
+        super().__init__()
+        self.temperature = temperature
+        self.lf_size = lf_size
+        self.lf_weight = lf_weight
+        self.hf_weight = hf_weight
+        # Cache keyed by (N, device, dtype) — survives multi-GPU / fp32-only paths.
+        self._dct_cache: Dict[tuple, torch.Tensor] = {}
+        self._debug_steps_remaining = debug_steps
+        self.last_lf_raw: float = 0.0
+        self.last_hf_raw: float = 0.0
+        self.last_total_raw: float = 0.0
+
+    def _dct_matrix(self, N: int, device, dtype) -> torch.Tensor:
+        """Orthonormal DCT-II matrix of side N."""
+        key = (N, device, dtype)
+        cached = self._dct_cache.get(key)
+        if cached is not None:
+            return cached
+        n = torch.arange(N, device=device, dtype=dtype)
+        k = n.view(-1, 1)
+        D = torch.cos(torch.pi * (2 * n + 1) * k / (2 * N)) * (2.0 / N) ** 0.5
+        D[0] = D[0] / (2 ** 0.5)
+        self._dct_cache[key] = D
+        return D
+
+    def _dct2(self, x: torch.Tensor) -> torch.Tensor:
+        """2D DCT-II along the last two dims; preserves leading dims.
+
+        Implemented as Dh @ x @ Dw^T (matrix DCT). For 256x256 maps with B*C
+        in the leading dims this is a few batched matmuls — fast vs FFT-DCT.
+        """
+        H, W = x.shape[-2:]
+        Dh = self._dct_matrix(H, x.device, x.dtype)
+        Dw = self._dct_matrix(W, x.device, x.dtype)
+        x_t = torch.einsum("ij,...jk->...ik", Dh, x)
+        x_t = torch.einsum("...ik,jk->...ij", x_t, Dw)
+        return x_t
+
+    @torch.amp.autocast("cuda", enabled=False)
+    def forward(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Returns scalar loss (already scaled by T²)."""
+        T = self.temperature
+        # fp32 promotion for DCT precision (softmax then DCT in fp16 underflows).
+        s_prob = F.softmax(student_logits.float() / T, dim=1)
+        t_prob = F.softmax(teacher_logits.float() / T, dim=1)
+
+        H, W = s_prob.shape[-2:]
+        K = min(self.lf_size, H, W)
+
+        s_dct = self._dct2(s_prob)
+        t_dct = self._dct2(t_prob)
+
+        s_lf = s_dct[..., :K, :K]
+        t_lf = t_dct[..., :K, :K]
+        lf_loss = F.mse_loss(s_lf, t_lf)
+
+        # HF residual = full - LF block. Compute via squared-norm difference.
+        full_sq = (s_dct - t_dct).pow(2)
+        lf_sq = (s_lf - t_lf).pow(2)
+        total_elems = full_sq.numel()
+        lf_elems = lf_sq.numel()
+        hf_elems = max(total_elems - lf_elems, 1)
+        hf_loss = (full_sq.sum() - lf_sq.sum()) / hf_elems
+
+        weighted = self.lf_weight * lf_loss + self.hf_weight * hf_loss
+
+        # Stash raw magnitudes for outside-loop calibration logging.
+        self.last_lf_raw = lf_loss.detach().item()
+        self.last_hf_raw = hf_loss.detach().item()
+        self.last_total_raw = weighted.detach().item()
+        if self._debug_steps_remaining > 0:
+            print(
+                f"  [ufd_kd debug] H={H} W={W} K={K} "
+                f"lf_raw={self.last_lf_raw:.3e} hf_raw={self.last_hf_raw:.3e} "
+                f"weighted={self.last_total_raw:.3e} "
+                f"final(×T²={T**2:.0f})={(self.last_total_raw * T**2):.3e}"
+            )
+            self._debug_steps_remaining -= 1
+
+        return weighted * (T ** 2)
+
+
 class DistillationLoss(nn.Module):
     """Knowledge distillation loss from teacher soft targets.
 
@@ -374,6 +504,7 @@ class DistillationLoss(nn.Module):
         ufd_lf_size: int = 32,
         ufd_lf_weight: float = 1.0,
         ufd_hf_weight: float = 3.0,
+        ufd_debug_steps: int = 0,
     ):
         super().__init__()
         self.temperature = temperature
@@ -385,6 +516,7 @@ class DistillationLoss(nn.Module):
                 lf_size=ufd_lf_size,
                 lf_weight=ufd_lf_weight,
                 hf_weight=ufd_hf_weight,
+                debug_steps=ufd_debug_steps,
             )
         elif loss_type != "kl_div":
             raise ValueError(
@@ -457,114 +589,6 @@ class DistillationLoss(nn.Module):
         return losses
 
 
-class FrequencyDecoupledDistillLoss(nn.Module):
-    """Frequency-decoupled KD for dense predictions (adapted from UFD-KD, BMVC 2025).
-
-    Standard per-pixel KL on segmentation logits averages over all pixels,
-    diluting rare/small-object signal (e.g. Dead nuclei occupy <2% of pixels
-    so their KL contribution is dwarfed by background). High-frequency
-    components of the softmax map carry most of the rare-class and boundary
-    information; low-frequency components carry the global class layout.
-
-    This loss:
-      1. Converts student/teacher logits to softmax with temperature T.
-      2. Applies 2D DCT-II across the (H, W) spatial axes for each (B, C).
-      3. Splits DCT coefficients into LF block (top-left K_lf × K_lf) and HF
-         residual (everything else).
-      4. Computes weighted MSE in the DCT domain on each band:
-         L = w_lf * MSE(s_lf, t_lf) + w_hf * MSE(s_hf, t_hf).
-      5. Scales by T² (KD convention) and returns a scalar.
-
-    Args:
-        temperature: KD softmax temperature.
-        lf_size: Side length of the LF block to keep (e.g. 32 for a 256x256
-            map keeps DC + the 32x32 lowest-frequency components).
-        lf_weight: Multiplier on the LF-band MSE.
-        hf_weight: Multiplier on the HF-band MSE. For rare-class focus set
-            hf_weight > lf_weight (HF carries small-object information).
-    """
-
-    def __init__(
-        self,
-        temperature: float = 10.0,
-        lf_size: int = 32,
-        lf_weight: float = 1.0,
-        hf_weight: float = 3.0,
-    ):
-        super().__init__()
-        self.temperature = temperature
-        self.lf_size = lf_size
-        self.lf_weight = lf_weight
-        self.hf_weight = hf_weight
-        # DCT matrices are precomputed and cached lazily per (H, W) the first
-        # time the loss sees that shape (single-resolution training only
-        # touches one size, so the cache stays trivial).
-        self._dct_cache: Dict[int, torch.Tensor] = {}
-
-    def _dct_matrix(self, N: int, device, dtype) -> torch.Tensor:
-        """Orthonormal DCT-II matrix of side N, cached per device/dtype."""
-        key = N
-        cached = self._dct_cache.get(key)
-        if (
-            cached is not None
-            and cached.device == device
-            and cached.dtype == dtype
-        ):
-            return cached
-        n = torch.arange(N, device=device, dtype=dtype)
-        k = n.view(-1, 1)
-        D = torch.cos(torch.pi * (2 * n + 1) * k / (2 * N)) * (2.0 / N) ** 0.5
-        D[0] = D[0] / (2 ** 0.5)
-        self._dct_cache[key] = D
-        return D
-
-    def _dct2(self, x: torch.Tensor) -> torch.Tensor:
-        """2D DCT-II along the last two dims; preserves leading dims.
-
-        Implemented as Dh @ x @ Dw^T (matrix DCT). For our 256x256 maps with
-        B*C in the leading dims this is a few O(N^3) batched matmuls — fast.
-        """
-        H, W = x.shape[-2:]
-        Dh = self._dct_matrix(H, x.device, x.dtype)
-        Dw = self._dct_matrix(W, x.device, x.dtype)
-        # Dh @ x: contract along H. x: (..., H, W). Dh: (H, H).
-        x_t = torch.einsum("ij,...jk->...ik", Dh, x)
-        x_t = torch.einsum("...ik,jk->...ij", x_t, Dw)
-        return x_t
-
-    @torch.amp.autocast("cuda", enabled=False)
-    def forward(
-        self,
-        student_logits: torch.Tensor,
-        teacher_logits: torch.Tensor,
-    ) -> torch.Tensor:
-        """Returns scalar loss (already scaled by T²)."""
-        T = self.temperature
-        s_prob = F.softmax(student_logits.float() / T, dim=1)
-        t_prob = F.softmax(teacher_logits.float() / T, dim=1)
-
-        # 2D DCT (per-batch, per-channel)
-        s_dct = self._dct2(s_prob)
-        t_dct = self._dct2(t_prob)
-
-        K = self.lf_size
-        # LF block (top-left)
-        s_lf = s_dct[..., :K, :K]
-        t_lf = t_dct[..., :K, :K]
-        lf_loss = F.mse_loss(s_lf, t_lf)
-
-        # HF residual = full - LF (mask out LF block, average over the rest)
-        # Compute via difference of squared norms for efficiency.
-        full_sq = (s_dct - t_dct).pow(2)
-        lf_sq = (s_lf - t_lf).pow(2)
-        total_elems = full_sq.numel()
-        lf_elems = lf_sq.numel()
-        hf_elems = max(total_elems - lf_elems, 1)
-        hf_loss = (full_sq.sum() - lf_sq.sum()) / hf_elems
-
-        return (self.lf_weight * lf_loss + self.hf_weight * hf_loss) * (T ** 2)
-
-
 class CombinedLoss(nn.Module):
     """Combined GT + Distillation loss.
 
@@ -596,6 +620,7 @@ class CombinedLoss(nn.Module):
         ufd_lf_size: int = 32,
         ufd_lf_weight: float = 1.0,
         ufd_hf_weight: float = 3.0,
+        ufd_debug_steps: int = 0,
     ):
         super().__init__()
         self.alpha = alpha
@@ -619,6 +644,7 @@ class CombinedLoss(nn.Module):
                 ufd_lf_size=ufd_lf_size,
                 ufd_lf_weight=ufd_lf_weight,
                 ufd_hf_weight=ufd_hf_weight,
+                ufd_debug_steps=ufd_debug_steps,
             )
 
         if feature_distill_enabled:

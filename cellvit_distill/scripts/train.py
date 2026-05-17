@@ -358,6 +358,7 @@ def main():
         ufd_lf_size=dist_cfg.get("ufd_lf_size", 32),
         ufd_lf_weight=dist_cfg.get("ufd_lf_weight", 1.0),
         ufd_hf_weight=dist_cfg.get("ufd_hf_weight", 3.0),
+        ufd_debug_steps=dist_cfg.get("ufd_debug_steps", 0),
     )
 
     # --- Optimizer & Scheduler ---

@@ -67,7 +67,7 @@ training:
     enabled: false       # set to true for distillation experiment
     alpha: 0.2          # lower alpha — GT signal more important for small student
     temperature: 10.0   # higher T to soften teacher logits (were near one-hot at T=4)
-    loss_type: kl_div   # kl_div, mse, or combined
+    loss_type: kl_div   # kl_div | ufd_kd (Frequency-Decoupled KD)
     # Per-head distillation weights
     # hv_map set to 0: spatial augmentations (flips, rotations) require sign
     # correction on HV distance values, and GT HV maps are already exact.

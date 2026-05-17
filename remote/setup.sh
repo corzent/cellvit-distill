@@ -1,7 +1,9 @@
 #!/bin/bash
-# Setup script for RTX 5090 vast.ai / RunPod instance
+# Setup script for RTX 5090 vast.ai / RunPod instance.
+# Idempotent: safe to re-run; skips work that is already done.
 # Run on remote: bash setup.sh
 set -e
+set -o pipefail
 
 # ============ 0. Sanity checks ============
 echo "== GPU =="
@@ -25,12 +27,26 @@ fi
 cd cellvit-distill
 
 # ============ 4. Python environment ============
-uv venv --python 3.13
+if [ ! -d .venv ]; then
+    uv venv --python 3.13
+fi
 source .venv/bin/activate
-uv pip install -r requirements.txt
-# PyTorch with CUDA 12.4 for Blackwell support
-uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+
+# Skip torch install if a working CUDA-enabled torch is already present
+# (e.g. pre-baked vast.ai/RunPod image). Installing again risks downgrading
+# the CUDA wheel and breaking the driver match.
+if ! python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+    uv pip install -r requirements.txt
+    # PyTorch with CUDA 12.4 for Blackwell support
+    uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+else
+    echo "Existing torch with CUDA detected — keeping it; only topping up project deps."
+    uv pip install -r requirements.txt
+fi
 uv pip install python-docx markitdown gdown
+# vendor/CellViT post-proc module imports numba; not in requirements.txt.
+# vendor/CellViT decoder utils import einops; also not in requirements.txt.
+uv pip install numba einops
 
 # Fail fast if torch can't see the GPU (driver/wheel mismatch surfaces here, not 30 min in).
 python -c "import torch; assert torch.cuda.is_available(), 'CUDA not visible to torch'; print('torch sees:', torch.cuda.get_device_name())"
@@ -50,10 +66,16 @@ cd datasets/pannuke
 for fold in 1 2 3; do
     if [ ! -f fold${fold}/images.npy ]; then
         echo "Downloading fold ${fold}..."
-        wget --show-progress https://nuke.warwick.ac.uk/static/files/fold_${fold}.zip
+        wget --show-progress https://warwick.ac.uk/fac/cross_fac/tia/data/pannuke/fold_${fold}.zip
         unzip -q fold_${fold}.zip
         mv "Fold ${fold}" fold${fold}
         rm fold_${fold}.zip
+        # Warwick zip nests npy files: fold${N}/{images,masks}/fold${N}/{images,masks,types}.npy
+        # Code expects them at fold${N}/{images,masks,types}.npy — flatten.
+        mv fold${fold}/images/fold${fold}/images.npy fold${fold}/images.npy
+        mv fold${fold}/images/fold${fold}/types.npy  fold${fold}/types.npy
+        mv fold${fold}/masks/fold${fold}/masks.npy   fold${fold}/masks.npy
+        rm -rf fold${fold}/images fold${fold}/masks
     fi
 done
 cd ../..
@@ -63,7 +85,8 @@ cd ../..
 mkdir -p checkpoints
 if [ ! -f checkpoints/CellViT-SAM-H-x40.pth ]; then
     echo "Downloading CellViT-SAM-H checkpoint via gdown..."
-    gdown --id 1MvRKNzDW2eHbQb5rAgTEp6s2zAXHixRV \
+    # gdown >=5 dropped --id; pass the file id as a positional arg instead.
+    gdown 1MvRKNzDW2eHbQb5rAgTEp6s2zAXHixRV \
         -O checkpoints/CellViT-SAM-H-x40.pth
 fi
 if [ "$(stat -c%s checkpoints/CellViT-SAM-H-x40.pth)" -lt 1000000000 ]; then

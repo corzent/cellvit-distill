@@ -20,7 +20,11 @@ from tqdm import tqdm
 
 from cellvit_distill.data.pannuke import PanNukeDataset, get_val_transform
 from cellvit_distill.models.student import build_student
-from cellvit_distill.utils.postprocess import post_process_predictions
+from cellvit_distill.utils.postprocess import (
+    post_process_batch_parallel,
+    post_process_predictions,
+    make_postprocess_pool,
+)
 from cellvit_distill.utils.metrics import compute_all_metrics
 
 
@@ -89,45 +93,63 @@ def _tta_predict(model, images: torch.Tensor):
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, device, num_classes=5, tta=False):
-    """Run student on dataset and compute metrics."""
+def evaluate(model, dataloader, device, num_classes=5, tta=False, n_workers_post=32):
+    """Run student on dataset and compute metrics.
+
+    n_workers_post: size of multiprocessing pool for per-image post-processing
+        (HV-watershed + Hungarian matching). 0 disables parallelism.
+    """
     model.eval()
     all_pred_instances = []
     all_gt_instances = []
     all_pred_types = []
     all_gt_types = []
 
-    for batch in tqdm(dataloader, desc="Evaluating" + (" (TTA)" if tta else "")):
-        images = batch["image"].to(device)
+    pool = make_postprocess_pool(n_workers_post) if n_workers_post > 0 else None
+    try:
+        for batch in tqdm(dataloader, desc="Evaluating" + (" (TTA)" if tta else "")):
+            images = batch["image"].to(device)
 
-        if tta:
-            binary_pred, hv_pred, type_pred = _tta_predict(model, images)
-        else:
-            with torch.amp.autocast("cuda"):
-                outputs = model(images)
-            binary_pred = torch.softmax(outputs["binary"].float(), dim=1)[:, 1]
-            hv_pred = outputs["hv_map"].float()
-            type_pred = torch.softmax(outputs["type_map"].float(), dim=1)
+            if tta:
+                binary_pred, hv_pred, type_pred = _tta_predict(model, images)
+            else:
+                with torch.amp.autocast("cuda"):
+                    outputs = model(images)
+                binary_pred = torch.softmax(outputs["binary"].float(), dim=1)[:, 1]
+                hv_pred = outputs["hv_map"].float()
+                type_pred = torch.softmax(outputs["type_map"].float(), dim=1)
 
-        for i in range(images.shape[0]):
-            pred_inst, pred_type = post_process_predictions(
-                binary_pred[i].cpu().numpy(),
-                hv_pred[i].cpu().numpy(),
-                type_pred[i].cpu().numpy(),
-            )
-            gt_inst = batch["instance_map"][i].numpy()
-            gt_type = batch["type_map"][i].argmax(dim=0).numpy()
+            binary_np = binary_pred.cpu().numpy()
+            hv_np = hv_pred.cpu().numpy()
+            type_np = type_pred.cpu().numpy()
 
-            all_pred_instances.append(pred_inst)
-            all_gt_instances.append(gt_inst)
-            all_pred_types.append(pred_type)
-            all_gt_types.append(gt_type)
+            if pool is not None:
+                results = post_process_batch_parallel(binary_np, hv_np, type_np, pool)
+            else:
+                results = [
+                    post_process_predictions(binary_np[i], hv_np[i], type_np[i])
+                    for i in range(images.shape[0])
+                ]
 
-    metrics = compute_all_metrics(
-        all_pred_instances, all_gt_instances,
-        all_pred_types, all_gt_types,
-        num_classes=num_classes,
-    )
+            for i, (pred_inst, pred_type) in enumerate(results):
+                gt_inst = batch["instance_map"][i].numpy()
+                gt_type = batch["type_map"][i].argmax(dim=0).numpy()
+
+                all_pred_instances.append(pred_inst)
+                all_gt_instances.append(gt_inst)
+                all_pred_types.append(pred_type)
+                all_gt_types.append(gt_type)
+        metrics = compute_all_metrics(
+            all_pred_instances, all_gt_instances,
+            all_pred_types, all_gt_types,
+            num_classes=num_classes,
+            pool=pool,
+        )
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
+
     return metrics
 
 
@@ -141,6 +163,8 @@ def main():
     parser.add_argument("--test_fold", type=int, default=3)
     parser.add_argument("--tta", action="store_true",
                         help="Enable 8-way test-time augmentation (flips + 90° rotation)")
+    parser.add_argument("--n_workers_post", type=int, default=32,
+                        help="Worker processes for parallel post-processing (0 = serial)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -177,7 +201,8 @@ def main():
     # Evaluate
     metrics = evaluate(model, dataloader, device,
                        num_classes=cfg["data"]["num_classes"] - 1,
-                       tta=args.tta)
+                       tta=args.tta,
+                       n_workers_post=args.n_workers_post)
 
     experiment = "distill" if cfg["training"]["distillation"]["enabled"] else "baseline"
     tta_tag = " [TTA]" if args.tta else ""

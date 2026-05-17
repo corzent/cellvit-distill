@@ -1,0 +1,6 @@
+baseline	1	/workspace/cellvit-distill/cellvit_distill/runs/baseline_fastvit_s12_20260517_010255
+distill_resp	1	/workspace/cellvit-distill/cellvit_distill/runs/distill_fastvit_s12_20260517_020632
+baseline	2	/workspace/cellvit-distill/cellvit_distill/runs/baseline_fastvit_s12_20260517_032839
+distill_resp	2	/workspace/cellvit-distill/cellvit_distill/runs/distill_fastvit_s12_20260517_043310
+baseline	3	/workspace/cellvit-distill/cellvit_distill/runs/baseline_fastvit_s12_20260517_060753
+distill_resp	3	/workspace/cellvit-distill/cellvit_distill/runs/distill_fastvit_s12_20260517_072819

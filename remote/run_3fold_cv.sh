@@ -5,7 +5,10 @@
 # Writes a manifest of (condition, fold, run_dir) for the aggregator.
 # Idempotent: re-running skips (condition, fold) pairs already in the manifest.
 #
-# Estimated time on RTX 5090: ~4-5 h total (6 train runs × ~40-50 min + evals).
+# Estimated time on RTX 5090 with optimizations below: ~3-5 h total
+# (6 train runs + 12 evals). Hard to predict precisely until first run gives
+# real per-epoch tempo at batch 32 + 16 workers + val_every 5; original
+# config defaults would put this at 25-30 h, so we MUST tune.
 set -e
 set -o pipefail
 
@@ -25,6 +28,29 @@ DATA_DIR=/workspace/cellvit-distill/datasets/pannuke
 SOFT_TARGETS_DIR=/workspace/cellvit-distill/datasets/pannuke/soft_targets
 TEACHER_CKPT=/workspace/cellvit-distill/checkpoints/CellViT-SAM-H-x40.pth
 OUTPUT_DIR=/workspace/cellvit-distill/cellvit_distill/runs
+
+# Batch 16 (NuLite-T recipe). batch 64 was tried first — baseline worked
+# fine but distill catastrophically failed (mPQ 0.29 vs baseline 0.46).
+# Bisected: α=0.2 (config default) + batch ≥16 destabilizes the KD
+# gradient on this teacher/recipe combination; α=0.05 rescues training
+# (test at batch 16: mPQ 0.4650 at epoch 30, still rising). See
+# EXPERIMENT_LOG.md for the bisection. Sticking with batch 16 keeps the
+# recipe close to NuLite-T's published config (batch 16).
+BATCH_SIZE=16
+
+# α=0.05 for distill condition only; baseline ignores this override.
+DISTILL_ALPHA=0.05
+
+# vast.ai 5090 instance has 32 vCPU; config default num_workers=4 leaves
+# the data loader CPU-bound. Smoke test showed ~5 patches/sec on batch 8,
+# meaning GPU was ~90% idle waiting on data. Bumping to 16 workers.
+NUM_WORKERS=16
+
+# Validate every 5 epochs instead of every epoch. validate() runs the
+# expensive HoVer-watershed + linear_sum_assignment per image on CPU, so
+# val takes ~1/3 the time of train per epoch. early_stop_patience=20 in
+# epoch-units still works correctly (4 stagnant validations trigger stop).
+VAL_EVERY=5
 
 # Run one training + eval pass.
 # Args: condition_label, hold_out_fold, train_folds_yaml, config_path, extra_overrides...
@@ -55,6 +81,9 @@ run_one() {
             "logging.output_dir=${OUTPUT_DIR}" \
             "data.train_folds=${train_folds}" \
             "data.val_fold=${hold_out}" \
+            "training.batch_size=${BATCH_SIZE}" \
+            "data.num_workers=${NUM_WORKERS}" \
+            "training.val_every_n_epochs=${VAL_EVERY}" \
             "$@" \
         2>&1 | tee "$log"
 
@@ -87,7 +116,9 @@ for HOLD_OUT in 1 2 3; do
     esac
 
     run_one baseline      "$HOLD_OUT" "$TRAIN" "$BASELINE_CFG"
-    run_one distill_resp  "$HOLD_OUT" "$TRAIN" "$BASELINE_CFG" "training.distillation.enabled=true"
+    run_one distill_resp  "$HOLD_OUT" "$TRAIN" "$BASELINE_CFG" \
+        "training.distillation.enabled=true" \
+        "training.distillation.alpha=${DISTILL_ALPHA}"
 done
 
 echo "============================================"

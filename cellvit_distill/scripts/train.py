@@ -354,6 +354,10 @@ def main():
         beta=fd_cfg.get("beta", 1.0),
         feature_loss_use_cosine=fd_cfg.get("use_cosine", True),
         feature_loss_cosine_weight=fd_cfg.get("cosine_weight", 0.5),
+        distill_loss_type=dist_cfg.get("loss_type", "kl_div"),
+        ufd_lf_size=dist_cfg.get("ufd_lf_size", 32),
+        ufd_lf_weight=dist_cfg.get("ufd_lf_weight", 1.0),
+        ufd_hf_weight=dist_cfg.get("ufd_hf_weight", 3.0),
     )
 
     # --- Optimizer & Scheduler ---

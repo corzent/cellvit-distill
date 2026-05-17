@@ -362,13 +362,35 @@ class DistillationLoss(nn.Module):
     """Knowledge distillation loss from teacher soft targets.
 
     For classification heads (binary, type): KL divergence on temperature-scaled logits
-    For regression head (HV maps): MSE between teacher and student predictions
+        (loss_type="kl_div") or Frequency-Decoupled KD (loss_type="ufd_kd").
+    For regression head (HV maps): MSE between teacher and student predictions.
     """
 
-    def __init__(self, temperature: float = 4.0, head_weights: Dict[str, float] = None):
+    def __init__(
+        self,
+        temperature: float = 4.0,
+        head_weights: Dict[str, float] = None,
+        loss_type: str = "kl_div",
+        ufd_lf_size: int = 32,
+        ufd_lf_weight: float = 1.0,
+        ufd_hf_weight: float = 3.0,
+    ):
         super().__init__()
         self.temperature = temperature
         self.head_weights = head_weights or {"binary": 1.0, "hv_map": 1.0, "type_map": 1.0}
+        self.loss_type = loss_type
+        if loss_type == "ufd_kd":
+            self.fdkd = FrequencyDecoupledDistillLoss(
+                temperature=temperature,
+                lf_size=ufd_lf_size,
+                lf_weight=ufd_lf_weight,
+                hf_weight=ufd_hf_weight,
+            )
+        elif loss_type != "kl_div":
+            raise ValueError(
+                f"Unknown distillation loss_type={loss_type!r}; "
+                "expected 'kl_div' or 'ufd_kd'"
+            )
 
     @torch.amp.autocast("cuda", enabled=False)
     def _spatial_kl(self, student_logits: torch.Tensor, teacher_logits: torch.Tensor) -> torch.Tensor:
@@ -406,9 +428,14 @@ class DistillationLoss(nn.Module):
         """
         losses = {}
 
-        # Binary head: KL divergence (per-pixel mean)
+        # Classification heads (binary, type): KL or UFD-KD per loss_type.
+        def _classifier_distill(student, teacher):
+            if self.loss_type == "ufd_kd":
+                return self.fdkd(student, teacher)
+            return self._spatial_kl(student, teacher)
+
         losses["distill_binary"] = (
-            self._spatial_kl(pred["binary"], soft_targets["soft_binary"])
+            _classifier_distill(pred["binary"], soft_targets["soft_binary"])
             * self.head_weights["binary"]
         )
 
@@ -420,14 +447,122 @@ class DistillationLoss(nn.Module):
         num_pixels = nucleus_mask.sum().clamp(min=1)
         losses["distill_hv"] = (hv_diff.sum() / num_pixels) * self.head_weights["hv_map"]
 
-        # Type head: KL divergence (per-pixel mean)
+        # Type head: KL or UFD-KD per loss_type.
         losses["distill_type"] = (
-            self._spatial_kl(pred["type_map"], soft_targets["soft_type"])
+            _classifier_distill(pred["type_map"], soft_targets["soft_type"])
             * self.head_weights["type_map"]
         )
 
         losses["distill_total"] = sum(v for k, v in losses.items() if k != "distill_total")
         return losses
+
+
+class FrequencyDecoupledDistillLoss(nn.Module):
+    """Frequency-decoupled KD for dense predictions (adapted from UFD-KD, BMVC 2025).
+
+    Standard per-pixel KL on segmentation logits averages over all pixels,
+    diluting rare/small-object signal (e.g. Dead nuclei occupy <2% of pixels
+    so their KL contribution is dwarfed by background). High-frequency
+    components of the softmax map carry most of the rare-class and boundary
+    information; low-frequency components carry the global class layout.
+
+    This loss:
+      1. Converts student/teacher logits to softmax with temperature T.
+      2. Applies 2D DCT-II across the (H, W) spatial axes for each (B, C).
+      3. Splits DCT coefficients into LF block (top-left K_lf × K_lf) and HF
+         residual (everything else).
+      4. Computes weighted MSE in the DCT domain on each band:
+         L = w_lf * MSE(s_lf, t_lf) + w_hf * MSE(s_hf, t_hf).
+      5. Scales by T² (KD convention) and returns a scalar.
+
+    Args:
+        temperature: KD softmax temperature.
+        lf_size: Side length of the LF block to keep (e.g. 32 for a 256x256
+            map keeps DC + the 32x32 lowest-frequency components).
+        lf_weight: Multiplier on the LF-band MSE.
+        hf_weight: Multiplier on the HF-band MSE. For rare-class focus set
+            hf_weight > lf_weight (HF carries small-object information).
+    """
+
+    def __init__(
+        self,
+        temperature: float = 10.0,
+        lf_size: int = 32,
+        lf_weight: float = 1.0,
+        hf_weight: float = 3.0,
+    ):
+        super().__init__()
+        self.temperature = temperature
+        self.lf_size = lf_size
+        self.lf_weight = lf_weight
+        self.hf_weight = hf_weight
+        # DCT matrices are precomputed and cached lazily per (H, W) the first
+        # time the loss sees that shape (single-resolution training only
+        # touches one size, so the cache stays trivial).
+        self._dct_cache: Dict[int, torch.Tensor] = {}
+
+    def _dct_matrix(self, N: int, device, dtype) -> torch.Tensor:
+        """Orthonormal DCT-II matrix of side N, cached per device/dtype."""
+        key = N
+        cached = self._dct_cache.get(key)
+        if (
+            cached is not None
+            and cached.device == device
+            and cached.dtype == dtype
+        ):
+            return cached
+        n = torch.arange(N, device=device, dtype=dtype)
+        k = n.view(-1, 1)
+        D = torch.cos(torch.pi * (2 * n + 1) * k / (2 * N)) * (2.0 / N) ** 0.5
+        D[0] = D[0] / (2 ** 0.5)
+        self._dct_cache[key] = D
+        return D
+
+    def _dct2(self, x: torch.Tensor) -> torch.Tensor:
+        """2D DCT-II along the last two dims; preserves leading dims.
+
+        Implemented as Dh @ x @ Dw^T (matrix DCT). For our 256x256 maps with
+        B*C in the leading dims this is a few O(N^3) batched matmuls — fast.
+        """
+        H, W = x.shape[-2:]
+        Dh = self._dct_matrix(H, x.device, x.dtype)
+        Dw = self._dct_matrix(W, x.device, x.dtype)
+        # Dh @ x: contract along H. x: (..., H, W). Dh: (H, H).
+        x_t = torch.einsum("ij,...jk->...ik", Dh, x)
+        x_t = torch.einsum("...ik,jk->...ij", x_t, Dw)
+        return x_t
+
+    @torch.amp.autocast("cuda", enabled=False)
+    def forward(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Returns scalar loss (already scaled by T²)."""
+        T = self.temperature
+        s_prob = F.softmax(student_logits.float() / T, dim=1)
+        t_prob = F.softmax(teacher_logits.float() / T, dim=1)
+
+        # 2D DCT (per-batch, per-channel)
+        s_dct = self._dct2(s_prob)
+        t_dct = self._dct2(t_prob)
+
+        K = self.lf_size
+        # LF block (top-left)
+        s_lf = s_dct[..., :K, :K]
+        t_lf = t_dct[..., :K, :K]
+        lf_loss = F.mse_loss(s_lf, t_lf)
+
+        # HF residual = full - LF (mask out LF block, average over the rest)
+        # Compute via difference of squared norms for efficiency.
+        full_sq = (s_dct - t_dct).pow(2)
+        lf_sq = (s_lf - t_lf).pow(2)
+        total_elems = full_sq.numel()
+        lf_elems = lf_sq.numel()
+        hf_elems = max(total_elems - lf_elems, 1)
+        hf_loss = (full_sq.sum() - lf_sq.sum()) / hf_elems
+
+        return (self.lf_weight * lf_loss + self.hf_weight * hf_loss) * (T ** 2)
 
 
 class CombinedLoss(nn.Module):
@@ -457,6 +592,10 @@ class CombinedLoss(nn.Module):
         beta: float = 1.0,
         feature_loss_use_cosine: bool = True,
         feature_loss_cosine_weight: float = 0.5,
+        distill_loss_type: str = "kl_div",
+        ufd_lf_size: int = 32,
+        ufd_lf_weight: float = 1.0,
+        ufd_hf_weight: float = 3.0,
     ):
         super().__init__()
         self.alpha = alpha
@@ -473,7 +612,14 @@ class CombinedLoss(nn.Module):
         )
 
         if distillation_enabled:
-            self.distill_loss = DistillationLoss(temperature, head_weights)
+            self.distill_loss = DistillationLoss(
+                temperature,
+                head_weights,
+                loss_type=distill_loss_type,
+                ufd_lf_size=ufd_lf_size,
+                ufd_lf_weight=ufd_lf_weight,
+                ufd_hf_weight=ufd_hf_weight,
+            )
 
         if feature_distill_enabled:
             self.feature_match_loss = FeatureMatchLoss(

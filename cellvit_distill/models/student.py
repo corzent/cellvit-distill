@@ -15,6 +15,8 @@ import torch.nn.functional as F
 import timm
 from typing import Dict, List, Optional
 
+from cellvit_distill.models.mamba_decoder import MambaDecoder
+
 
 class ConvBNReLU(nn.Module):
     """Conv2d + BatchNorm + ReLU block."""
@@ -125,6 +127,11 @@ class StudentCellViT(nn.Module):
         feature_distill: bool = False,
         teacher_feat_dim: int = 1280,
         feature_distill_stage: int = 2,  # 0-indexed: 2 = third stage, usually 16x16 for 256x256 input
+        decoder_type: str = "conv",  # "conv" (HoVer-Net) | "mamba" (SSM)
+        mamba_groups: int = 4,
+        mamba_d_state: int = 16,
+        mamba_scan_pattern: str = "bidirectional",  # fwd | bidirectional | cross_scan_4way
+        mamba_version: str = "v1",  # v1 | v2
     ):
         super().__init__()
         self.encoder_name = encoder_name
@@ -132,6 +139,7 @@ class StudentCellViT(nn.Module):
         self.tissue_aux = tissue_aux
         self.feature_distill = feature_distill
         self.feature_distill_stage = feature_distill_stage
+        self.decoder_type = decoder_type
 
         # Get encoder config
         if encoder_name not in self.ENCODER_CONFIGS:
@@ -153,8 +161,21 @@ class StudentCellViT(nn.Module):
             dummy_features = self.encoder(dummy_input)
             encoder_channels = [f.shape[1] for f in dummy_features]
 
-        # Shared decoder
-        self.decoder = HoVerNetDecoder(encoder_channels, decoder_channels)
+        # Decoder: conv (HoVer-Net) or mamba (SSM). Same input/output contract.
+        if decoder_type == "conv":
+            self.decoder = HoVerNetDecoder(encoder_channels, decoder_channels)
+        elif decoder_type == "mamba":
+            self.decoder = MambaDecoder(
+                encoder_channels=encoder_channels,
+                decoder_channels=decoder_channels,
+                groups=mamba_groups,
+                d_state=mamba_d_state,
+                scan_pattern=mamba_scan_pattern,
+                mamba_version=mamba_version,
+                use_real_mamba=True,
+            )
+        else:
+            raise ValueError(f"decoder_type={decoder_type!r} not in {{'conv', 'mamba'}}")
 
         feat_ch = self.decoder.final_channels
 
@@ -283,4 +304,9 @@ def build_student(cfg: dict):
         feature_distill=student_cfg.get("feature_distill", False),
         teacher_feat_dim=student_cfg.get("teacher_feat_dim", 1280),
         feature_distill_stage=student_cfg.get("feature_distill_stage", 2),
+        decoder_type=student_cfg.get("decoder_type", "conv"),
+        mamba_groups=student_cfg.get("mamba_groups", 4),
+        mamba_d_state=student_cfg.get("mamba_d_state", 16),
+        mamba_scan_pattern=student_cfg.get("mamba_scan_pattern", "bidirectional"),
+        mamba_version=student_cfg.get("mamba_version", "v1"),
     )

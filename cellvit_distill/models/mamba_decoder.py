@@ -28,9 +28,18 @@ from typing import List, Optional
 # ----------------------------------------------------------------------
 
 
-def _try_import_mamba():
-    """Return (Mamba_cls, available_bool). None if mamba_ssm is missing."""
+def _try_import_mamba(version: str = "v1"):
+    """Return (Mamba_cls, available_bool).
+
+    version "v1" → Mamba1 (mamba_ssm.Mamba)
+    version "v2" → Mamba2 (mamba_ssm.Mamba2). More stable in bf16 per
+                   state-spaces/mamba issue tracker, preferred for vision.
+    None if the requested class is missing or mamba_ssm isn't installed.
+    """
     try:
+        if version == "v2":
+            from mamba_ssm import Mamba2  # type: ignore
+            return Mamba2, True
         from mamba_ssm import Mamba  # type: ignore
         return Mamba, True
     except Exception:
@@ -72,48 +81,103 @@ class _MambaPlaceholder(nn.Module):
         return residual + self.out_proj(x)
 
 
-class MambaBlock(nn.Module):
-    """Wrapper that runs Mamba on a 2D feature map.
+_SCAN_PATTERNS = ("fwd", "bidirectional", "cross_scan_4way")
 
-    Optional bidirectional scan (forward + reverse, averaged). Bidirectional
-    is required for non-causal vision tasks where future tokens carry signal
-    for past ones (BMVC 2024 vision-Mamba ablations confirm).
+
+class MambaBlock(nn.Module):
+    """Wrapper that runs Mamba on a 2D feature map with a selectable scan pattern.
+
+    scan_pattern:
+        "fwd"             — single forward row-major scan.
+        "bidirectional"   — forward + reverse row-major, averaged.
+        "cross_scan_4way" — VMamba SS2D style: row-fwd + row-rev + col-fwd +
+                            col-rev, averaged. Best ImageNet results in
+                            VMamba paper; +2 Mamba layers worth of compute.
+
+    mamba_version:
+        "v1" — mamba_ssm.Mamba (older, more reports of bf16 instability).
+        "v2" — mamba_ssm.Mamba2 (newer, preferred for vision).
+
+    use_real_mamba=False forces the CPU-friendly placeholder regardless of
+    whether mamba_ssm is installed — useful for shape tests on CPU machines.
     """
 
     def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4,
-                 expand: int = 2, bidirectional: bool = True,
-                 use_real_mamba: bool = True):
+                 expand: int = 2, scan_pattern: str = "bidirectional",
+                 mamba_version: str = "v1", use_real_mamba: bool = True,
+                 # Legacy kwarg: kept for tests that still pass bidirectional=...
+                 bidirectional: Optional[bool] = None):
         super().__init__()
-        Mamba, real_available = _try_import_mamba()
+        if bidirectional is not None:
+            scan_pattern = "bidirectional" if bidirectional else "fwd"
+        if scan_pattern not in _SCAN_PATTERNS:
+            raise ValueError(f"scan_pattern={scan_pattern!r} not in {_SCAN_PATTERNS}")
+        self.scan_pattern = scan_pattern
+        self.mamba_version = mamba_version
+
+        Mamba, real_available = _try_import_mamba(mamba_version)
         if use_real_mamba and not real_available:
-            # Silent fallback so dev can iterate on architecture before env ready
             cls = _MambaPlaceholder
             self._using_real = False
         else:
             cls = Mamba if use_real_mamba else _MambaPlaceholder
             self._using_real = use_real_mamba and real_available
-        self.fwd = cls(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.bwd = cls(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand) if bidirectional else None
-        self.bidirectional = bidirectional
+
+        # One submodule per scan direction. For "fwd" → 1, "bidirectional" → 2,
+        # "cross_scan_4way" → 4. Each owns its own selective-scan parameters.
+        n_scans = {"fwd": 1, "bidirectional": 2, "cross_scan_4way": 4}[scan_pattern]
+        self.scans = nn.ModuleList([
+            cls(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+            for _ in range(n_scans)
+        ])
 
     @property
     def using_real_mamba(self) -> bool:
         return self._using_real
 
-    def _scan(self, x_seq: torch.Tensor) -> torch.Tensor:
-        """x_seq: (B, L, D)."""
-        y = self.fwd(x_seq)
-        if self.bwd is not None:
-            y_rev = self.bwd(x_seq.flip(dims=[1])).flip(dims=[1])
-            y = (y + y_rev) * 0.5
-        return y
+    def _flatten_pattern(self, x: torch.Tensor, idx: int) -> torch.Tensor:
+        """Reorder (B, C, H, W) to (B, L, C) for scan #idx, returning the flat seq."""
+        if self.scan_pattern == "fwd":
+            return x.flatten(2).transpose(1, 2)            # row-major fwd
+        if self.scan_pattern == "bidirectional":
+            seq = x.flatten(2).transpose(1, 2)
+            return seq if idx == 0 else seq.flip(dims=[1])
+        # cross_scan_4way: 0=row-fwd, 1=row-rev, 2=col-fwd, 3=col-rev
+        if idx in (0, 1):
+            seq = x.flatten(2).transpose(1, 2)             # row-major
+        else:
+            seq = x.transpose(-1, -2).flatten(2).transpose(1, 2)  # column-major
+        if idx in (1, 3):
+            seq = seq.flip(dims=[1])
+        return seq
+
+    def _unflatten_pattern(self, seq: torch.Tensor, idx: int, H: int, W: int) -> torch.Tensor:
+        """Invert _flatten_pattern, returning (B, C, H, W)."""
+        if self.scan_pattern == "bidirectional" and idx == 1:
+            seq = seq.flip(dims=[1])
+        if self.scan_pattern == "cross_scan_4way" and idx in (1, 3):
+            seq = seq.flip(dims=[1])
+        # idx 0/1 (row-major) -> reshape direct; idx 2/3 (col-major) -> reshape transposed
+        B = seq.shape[0]
+        C = seq.shape[2]
+        if self.scan_pattern == "cross_scan_4way" and idx in (2, 3):
+            # seq came from x.transpose(-1, -2) with shape (B, W*H, C). Reshape to
+            # (B, C, W, H) then transpose to (B, C, H, W).
+            return seq.transpose(1, 2).reshape(B, C, W, H).transpose(-1, -2)
+        return seq.transpose(1, 2).reshape(B, C, H, W)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, C, H, W). Returns: (B, C, H, W)."""
         B, C, H, W = x.shape
-        x_seq = x.flatten(2).transpose(1, 2)  # (B, H*W, C)
-        y = self._scan(x_seq)
-        return y.transpose(1, 2).reshape(B, C, H, W)
+        outs = []
+        for idx, scan in enumerate(self.scans):
+            seq = self._flatten_pattern(x, idx)
+            y = scan(seq)
+            outs.append(self._unflatten_pattern(y, idx, H, W))
+        if len(outs) == 1:
+            return outs[0]
+        # Stack along new dim and average — same as sum / n but cheaper to write
+        return torch.stack(outs, dim=0).mean(dim=0)
 
 
 class PVMBlock(nn.Module):
@@ -125,15 +189,18 @@ class PVMBlock(nn.Module):
     """
 
     def __init__(self, channels: int, groups: int = 4, d_state: int = 16,
-                 bidirectional: bool = True, use_real_mamba: bool = True):
+                 scan_pattern: str = "bidirectional", mamba_version: str = "v1",
+                 use_real_mamba: bool = True,
+                 bidirectional: Optional[bool] = None):
         super().__init__()
         assert channels % groups == 0, f"channels {channels} not divisible by groups {groups}"
         per = channels // groups
         self.groups = groups
         self.per = per
         self.blocks = nn.ModuleList([
-            MambaBlock(d_model=per, d_state=d_state, bidirectional=bidirectional,
-                       use_real_mamba=use_real_mamba)
+            MambaBlock(d_model=per, d_state=d_state, scan_pattern=scan_pattern,
+                       mamba_version=mamba_version, use_real_mamba=use_real_mamba,
+                       bidirectional=bidirectional)
             for _ in range(groups)
         ])
         self.norm = nn.GroupNorm(num_groups=min(8, channels), num_channels=channels)
@@ -162,13 +229,17 @@ class MambaDecoderBlock(nn.Module):
 
     def __init__(self, in_ch: int, skip_ch: int, out_ch: int,
                  groups: int = 4, d_state: int = 16,
-                 bidirectional: bool = True, use_real_mamba: bool = True):
+                 scan_pattern: str = "bidirectional", mamba_version: str = "v1",
+                 use_real_mamba: bool = True,
+                 bidirectional: Optional[bool] = None):
         super().__init__()
         self.upsample = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
         merged = in_ch + skip_ch
         self.proj_in = nn.Conv2d(merged, out_ch, kernel_size=1, bias=False)
         self.pvm = PVMBlock(out_ch, groups=groups, d_state=d_state,
-                            bidirectional=bidirectional, use_real_mamba=use_real_mamba)
+                            scan_pattern=scan_pattern, mamba_version=mamba_version,
+                            use_real_mamba=use_real_mamba,
+                            bidirectional=bidirectional)
         self.proj_out = nn.Sequential(
             nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(num_groups=min(8, out_ch), num_channels=out_ch),
@@ -204,7 +275,9 @@ class MambaDecoder(nn.Module):
 
     def __init__(self, encoder_channels: List[int], decoder_channels: List[int],
                  groups: int = 4, d_state: int = 16,
-                 bidirectional: bool = True, use_real_mamba: bool = True):
+                 scan_pattern: str = "bidirectional", mamba_version: str = "v1",
+                 use_real_mamba: bool = True,
+                 bidirectional: Optional[bool] = None):
         super().__init__()
         self.blocks = nn.ModuleList()
         in_ch = encoder_channels[-1]
@@ -217,7 +290,9 @@ class MambaDecoder(nn.Module):
             self.blocks.append(MambaDecoderBlock(
                 in_ch=in_ch, skip_ch=skip_ch, out_ch=out_ch,
                 groups=groups, d_state=d_state,
-                bidirectional=bidirectional, use_real_mamba=use_real_mamba,
+                scan_pattern=scan_pattern, mamba_version=mamba_version,
+                use_real_mamba=use_real_mamba,
+                bidirectional=bidirectional,
             ))
             in_ch = out_ch
         self.final_channels = in_ch
@@ -243,26 +318,34 @@ class MambaDecoder(nn.Module):
 if __name__ == "__main__":
     import sys
     print("=" * 60)
-    print("MambaDecoder smoke")
+    print("MambaDecoder smoke (all scan patterns × both Mamba versions)")
     print("=" * 60)
 
     enc_chs = [64, 128, 256, 512]   # FastViT-S12
     dec_chs = [256, 128, 64, 32]    # current student decoder widths
-    dec = MambaDecoder(enc_chs, dec_chs, groups=4, d_state=16,
-                       bidirectional=True, use_real_mamba=True)
-    print(f"using_real_mamba: {dec.using_real_mamba}")
-    n_params = sum(p.numel() for p in dec.parameters())
-    print(f"decoder params:   {n_params/1e6:.2f}M  (target ≤5M)")
-
-    # Fake encoder features at 256x256 input (FastViT downsamples 4×, 8×, 16×, 32×)
     feats = [
         torch.randn(2, 64,  64, 64),
         torch.randn(2, 128, 32, 32),
         torch.randn(2, 256, 16, 16),
         torch.randn(2, 512,  8,  8),
     ]
-    y = dec(feats)
-    print(f"output shape:     {tuple(y.shape)}  (expect [2, {dec_chs[-1]}, 128, 128])")
-    assert y.shape[1] == dec_chs[-1], "channel mismatch"
-    print("forward ok.")
-    sys.exit(0)
+
+    rows = []
+    for scan in _SCAN_PATTERNS:
+        for ver in ("v1", "v2"):
+            dec = MambaDecoder(enc_chs, dec_chs, groups=4, d_state=16,
+                               scan_pattern=scan, mamba_version=ver,
+                               use_real_mamba=True)
+            n_params = sum(p.numel() for p in dec.parameters())
+            y = dec(feats)
+            real = "real" if dec.using_real_mamba else "stub"
+            ok = y.shape == (2, dec_chs[-1], 128, 128)
+            rows.append((scan, ver, real, n_params / 1e6, tuple(y.shape), ok))
+
+    print(f"{'scan':22} {'ver':4} {'kernel':6} {'params(M)':>10} {'out_shape':>22} ok")
+    print("-" * 70)
+    for r in rows:
+        scan, ver, real, mp, sh, ok = r
+        print(f"{scan:22} {ver:4} {real:6} {mp:>10.2f} {str(sh):>22} {'✓' if ok else '✗'}")
+
+    sys.exit(0 if all(r[-1] for r in rows) else 1)

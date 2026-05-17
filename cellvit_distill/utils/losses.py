@@ -488,11 +488,129 @@ class FrequencyDecoupledDistillLoss(nn.Module):
         return weighted * (T ** 2)
 
 
+class DecoupledDistillLoss(nn.Module):
+    """Decoupled Knowledge Distillation (Zhao et al., CVPR 2022).
+
+    Decomposes per-pixel KL(p_t || p_s) into two complementary components:
+
+      TCKD (Target-Class KD): binary KL on (p(target), 1 - p(target)) —
+        measures agreement on the confident target prediction.
+      NCKD (Non-target-Class KD): KL on the non-target classes after
+        renormalization — measures agreement on the relative ranking of
+        wrong classes.
+
+    The paper observes that NCKD carries most of the dark-knowledge signal
+    but is *suppressed* by a factor (1 - p_t(c)) which goes to 0 when the
+    teacher is confident. Decoupling lets you reweight it independently
+    (recommended β ≫ α, paper defaults α=1.0 β=8.0).
+
+    For dense prediction the target class is taken as teacher's argmax
+    per pixel (keeps the DistillationLoss signature unchanged — no GT
+    map is required).
+
+    Numerically:
+      full_KL    = sum_k p_t(k) * (log p_t(k) - log p_s(k))
+      tgt_KL     = p_t(c) * (log p_t(c) - log p_s(c))
+      raw_nt_KL  = full_KL - tgt_KL
+      Z_t, Z_s   = 1 - p_t(c), 1 - p_s(c)
+      TCKD = tgt_KL + (1 - p_t(c)) * log((1 - p_t(c)) / (1 - p_s(c)))
+      NCKD = raw_nt_KL / Z_t  +  log(Z_s / Z_t)
+      L    = (α·TCKD + β·NCKD) · T²
+
+    Both TCKD and NCKD are scalar means over all spatial positions.
+
+    Debug attributes (populated after each forward):
+        last_tckd_raw, last_nckd_raw — pre-T² band means (Python floats).
+    """
+
+    def __init__(
+        self,
+        temperature: float = 10.0,
+        alpha: float = 1.0,
+        beta: float = 8.0,
+        eps: float = 1e-7,
+        debug_steps: int = 0,
+    ):
+        super().__init__()
+        self.temperature = temperature
+        self.alpha = alpha
+        self.beta = beta
+        self.eps = eps
+        self._debug_steps_remaining = debug_steps
+        self.last_tckd_raw: float = 0.0
+        self.last_nckd_raw: float = 0.0
+        self.last_total_raw: float = 0.0
+
+    @torch.amp.autocast("cuda", enabled=False)
+    def forward(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        T = self.temperature
+        s = student_logits.float()
+        t = teacher_logits.float()
+        B, C, H, W = s.shape
+
+        # Flatten spatial + batch into N pixels for vectorized indexing.
+        s_flat = s.permute(0, 2, 3, 1).reshape(-1, C)
+        t_flat = t.permute(0, 2, 3, 1).reshape(-1, C)
+
+        log_pt = F.log_softmax(t_flat / T, dim=1)
+        log_ps = F.log_softmax(s_flat / T, dim=1)
+        pt = log_pt.exp()
+
+        N = s_flat.shape[0]
+        idx = torch.arange(N, device=s.device)
+        # Per-pixel target class = teacher's argmax (max-likelihood class).
+        targets = t_flat.argmax(dim=1)
+
+        pt_tgt = pt[idx, targets]
+        log_pt_tgt = log_pt[idx, targets]
+        log_ps_tgt = log_ps[idx, targets]
+        ps_tgt = log_ps_tgt.exp()
+
+        # Full per-pixel KL and target-class component.
+        full_kl = (pt * (log_pt - log_ps)).sum(dim=1)
+        tgt_kl = pt_tgt * (log_pt_tgt - log_ps_tgt)
+        raw_nt_kl = full_kl - tgt_kl
+
+        # Z = 1 - p(target), clamped to avoid log(0) for confident teacher.
+        z_t = (1.0 - pt_tgt).clamp(min=self.eps)
+        z_s = (1.0 - ps_tgt).clamp(min=self.eps)
+
+        # TCKD: binary KL on (target, non-target).
+        tckd_per = tgt_kl + z_t * (z_t.log() - z_s.log())
+        tckd = tckd_per.mean()
+
+        # NCKD: renormalized KL on the non-target subspace.
+        nckd_per = raw_nt_kl / z_t + (z_s.log() - z_t.log())
+        nckd = nckd_per.mean()
+
+        weighted = self.alpha * tckd + self.beta * nckd
+
+        self.last_tckd_raw = tckd.detach().item()
+        self.last_nckd_raw = nckd.detach().item()
+        self.last_total_raw = weighted.detach().item()
+        if self._debug_steps_remaining > 0:
+            print(
+                f"  [dkd debug] H={H} W={W} C={C} "
+                f"tckd_raw={self.last_tckd_raw:.3e} nckd_raw={self.last_nckd_raw:.3e} "
+                f"weighted={self.last_total_raw:.3e} "
+                f"final(×T²={T**2:.0f})={(self.last_total_raw * T**2):.3e}"
+            )
+            self._debug_steps_remaining -= 1
+
+        return weighted * (T ** 2)
+
+
 class DistillationLoss(nn.Module):
     """Knowledge distillation loss from teacher soft targets.
 
-    For classification heads (binary, type): KL divergence on temperature-scaled logits
-        (loss_type="kl_div") or Frequency-Decoupled KD (loss_type="ufd_kd").
+    For classification heads (binary, type):
+        loss_type="kl_div"  — standard temperature-scaled KL on softmax
+        loss_type="ufd_kd"  — Frequency-Decoupled KD (DCT band split)
+        loss_type="dkd"     — Decoupled KD (TCKD + NCKD components)
     For regression head (HV maps): MSE between teacher and student predictions.
     """
 
@@ -505,6 +623,9 @@ class DistillationLoss(nn.Module):
         ufd_lf_weight: float = 1.0,
         ufd_hf_weight: float = 3.0,
         ufd_debug_steps: int = 0,
+        dkd_alpha: float = 1.0,
+        dkd_beta: float = 8.0,
+        dkd_debug_steps: int = 0,
     ):
         super().__init__()
         self.temperature = temperature
@@ -518,10 +639,17 @@ class DistillationLoss(nn.Module):
                 hf_weight=ufd_hf_weight,
                 debug_steps=ufd_debug_steps,
             )
+        elif loss_type == "dkd":
+            self.dkd = DecoupledDistillLoss(
+                temperature=temperature,
+                alpha=dkd_alpha,
+                beta=dkd_beta,
+                debug_steps=dkd_debug_steps,
+            )
         elif loss_type != "kl_div":
             raise ValueError(
                 f"Unknown distillation loss_type={loss_type!r}; "
-                "expected 'kl_div' or 'ufd_kd'"
+                "expected 'kl_div', 'ufd_kd', or 'dkd'"
             )
 
     @torch.amp.autocast("cuda", enabled=False)
@@ -560,10 +688,12 @@ class DistillationLoss(nn.Module):
         """
         losses = {}
 
-        # Classification heads (binary, type): KL or UFD-KD per loss_type.
+        # Classification heads (binary, type): KL / UFD-KD / DKD per loss_type.
         def _classifier_distill(student, teacher):
             if self.loss_type == "ufd_kd":
                 return self.fdkd(student, teacher)
+            if self.loss_type == "dkd":
+                return self.dkd(student, teacher)
             return self._spatial_kl(student, teacher)
 
         losses["distill_binary"] = (
@@ -621,6 +751,9 @@ class CombinedLoss(nn.Module):
         ufd_lf_weight: float = 1.0,
         ufd_hf_weight: float = 3.0,
         ufd_debug_steps: int = 0,
+        dkd_alpha: float = 1.0,
+        dkd_beta: float = 8.0,
+        dkd_debug_steps: int = 0,
     ):
         super().__init__()
         self.alpha = alpha
@@ -645,6 +778,9 @@ class CombinedLoss(nn.Module):
                 ufd_lf_weight=ufd_lf_weight,
                 ufd_hf_weight=ufd_hf_weight,
                 ufd_debug_steps=ufd_debug_steps,
+                dkd_alpha=dkd_alpha,
+                dkd_beta=dkd_beta,
+                dkd_debug_steps=dkd_debug_steps,
             )
 
         if feature_distill_enabled:

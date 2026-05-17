@@ -399,6 +399,9 @@ def main():
         ufd_lf_weight=dist_cfg.get("ufd_lf_weight", 1.0),
         ufd_hf_weight=dist_cfg.get("ufd_hf_weight", 3.0),
         ufd_debug_steps=dist_cfg.get("ufd_debug_steps", 0),
+        dkd_alpha=dist_cfg.get("dkd_alpha", 1.0),
+        dkd_beta=dist_cfg.get("dkd_beta", 8.0),
+        dkd_debug_steps=dist_cfg.get("dkd_debug_steps", 0),
     )
 
     # --- Optimizer & Scheduler ---

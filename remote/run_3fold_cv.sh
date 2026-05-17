@@ -29,14 +29,17 @@ SOFT_TARGETS_DIR=/workspace/cellvit-distill/datasets/pannuke/soft_targets
 TEACHER_CKPT=/workspace/cellvit-distill/checkpoints/CellViT-SAM-H-x40.pth
 OUTPUT_DIR=/workspace/cellvit-distill/cellvit_distill/runs
 
-# 5090 has 32 GB VRAM; student is ~12M params. batch 8 (config default) uses
-# only ~3-4 GB and severely underutilizes the GPU. batch 32 measured at
-# only ~5 GB VRAM during real training — plenty of headroom, bumped to 64.
-# Expected VRAM ~10 GB; another ~30% wall-clock cut on top of batch 32.
-# lr unchanged: AdamW with 10-epoch warmup absorbs the 8× batch increase
-# (vs config default) without retuning; first epochs of batch 32 run showed
-# clean loss descent.
-BATCH_SIZE=64
+# Batch 16 (NuLite-T recipe). batch 64 was tried first — baseline worked
+# fine but distill catastrophically failed (mPQ 0.29 vs baseline 0.46).
+# Bisected: α=0.2 (config default) + batch ≥16 destabilizes the KD
+# gradient on this teacher/recipe combination; α=0.05 rescues training
+# (test at batch 16: mPQ 0.4650 at epoch 30, still rising). See
+# EXPERIMENT_LOG.md for the bisection. Sticking with batch 16 keeps the
+# recipe close to NuLite-T's published config (batch 16).
+BATCH_SIZE=16
+
+# α=0.05 for distill condition only; baseline ignores this override.
+DISTILL_ALPHA=0.05
 
 # vast.ai 5090 instance has 32 vCPU; config default num_workers=4 leaves
 # the data loader CPU-bound. Smoke test showed ~5 patches/sec on batch 8,
@@ -113,7 +116,9 @@ for HOLD_OUT in 1 2 3; do
     esac
 
     run_one baseline      "$HOLD_OUT" "$TRAIN" "$BASELINE_CFG"
-    run_one distill_resp  "$HOLD_OUT" "$TRAIN" "$BASELINE_CFG" "training.distillation.enabled=true"
+    run_one distill_resp  "$HOLD_OUT" "$TRAIN" "$BASELINE_CFG" \
+        "training.distillation.enabled=true" \
+        "training.distillation.alpha=${DISTILL_ALPHA}"
 done
 
 echo "============================================"

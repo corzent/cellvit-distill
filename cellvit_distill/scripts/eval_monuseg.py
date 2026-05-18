@@ -40,6 +40,20 @@ from cellvit_distill.utils.postprocess import (
 from cellvit_distill.utils.metrics import panoptic_quality
 
 
+def _postprocess_and_pq(args):
+    """Module-level worker: HV-watershed + binary PQ for one full image.
+
+    args = (binary_prob, hv_map, gt_instance, num_classes).
+    Returns (PQ, DQ_as_F1).
+    """
+    binary_prob, hv_map, gt, num_classes = args
+    type_prob = np.zeros((num_classes,) + binary_prob.shape, dtype=np.float32)
+    type_prob[0] = 1.0
+    pred_inst, _ = post_process_predictions(binary_prob, hv_map, type_prob)
+    r = panoptic_quality(pred_inst, gt)
+    return r["PQ"], r["DQ"]
+
+
 def _forward_patches(model, patches: torch.Tensor, device, tta: bool):
     """Run model on a (B, 3, 256, 256) uint8 patch batch.
 
@@ -157,30 +171,35 @@ def main() -> int:
                         load_masks=True)
     print(f"MoNuSeg ({args.split}): {ds.num_images} images, {len(ds)} patches")
 
-    per_image_bpq = []
-    per_image_f1 = []
     image_names = []
-    pool = make_postprocess_pool(4)
+    # Phase 1: GPU stitching for all images (sequential — single GPU).
+    # Keep predictions in RAM (≈11 MB × num_images, fits easily).
+    stitched: list = []
+    num_classes = cfg["data"]["num_classes"]
+    with torch.no_grad():
+        for img_idx in tqdm(range(ds.num_images), desc="MoNuSeg stitch"):
+            binary_prob, hv_map, gt = _stitch_image(
+                model, ds, img_idx, device, tta=args.tta,
+                batch_size=args.batch_size,
+            )
+            stitched.append((binary_prob, hv_map, gt))
+            image_names.append(ds.image_names()[img_idx])
 
+    # Phase 2: CPU post-process + panoptic_quality in parallel across images.
+    # Each image-level call is ~30-60s single-threaded; with 8 workers the
+    # 14-image total drops from ~7 min to ~1.5 min.
+    print(f"Post-process + PQ on {len(stitched)} full-resolution images...")
+    pool = make_postprocess_pool(min(8, len(stitched)))
     try:
-        with torch.no_grad():
-            for img_idx in tqdm(range(ds.num_images), desc="MoNuSeg"):
-                binary_prob, hv_map, gt = _stitch_image(
-                    model, ds, img_idx, device, tta=args.tta, batch_size=args.batch_size
-                )
-                # Post-process at full image scale — dummy type prob (all background).
-                type_prob = np.zeros((cfg["data"]["num_classes"],) + binary_prob.shape, dtype=np.float32)
-                type_prob[0] = 1.0
-                pred_inst, _ = post_process_predictions(binary_prob, hv_map, type_prob)
-
-                # Binary panoptic quality
-                r = panoptic_quality(pred_inst, gt)
-                per_image_bpq.append(r["PQ"])
-                per_image_f1.append(r["DQ"])
-                image_names.append(ds.image_names()[img_idx])
+        args_list = [
+            (b, hv, gt, num_classes) for (b, hv, gt) in stitched
+        ]
+        results = pool.map(_postprocess_and_pq, args_list)
     finally:
         pool.close()
         pool.join()
+    per_image_bpq = [r[0] for r in results]
+    per_image_f1 = [r[1] for r in results]
 
     bpq = float(np.mean(per_image_bpq)) if per_image_bpq else 0.0
     f1 = float(np.mean(per_image_f1)) if per_image_f1 else 0.0

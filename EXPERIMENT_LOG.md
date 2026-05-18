@@ -673,3 +673,121 @@ noise.
 Mixed-history on `dev/post-master-work` is acknowledged debt (user
 flagged it; we chose rename-vs-resplit; per-commit each entry stays
 atomic and cherry-pickable).
+
+
+---
+
+## 2026-05-18 — DKD on Mamba + Phase E cross-dataset eval
+
+### DKD on Mamba (cs4_d64_g4 + DKD)
+
+Same config as Mamba+KL but loss_type=dkd, defaults α=1.0 β=8.0, outer α=0.05, T=10.
+
+  - **mPQ plain 0.4559, TTA 0.4631** (best at epoch 48 of 60).
+  - vs Mamba+no-KD (cs4_d64): plain −0.005, TTA −0.009.
+  - vs Mamba+KL (same config): TTA −0.003 (DKD slightly worse than KL).
+  - Per-class TTA Dead = 0.1155 vs no-KD ~0.119 — **rare-class hypothesis
+    failed**. NCKD β=8 reweighting that was supposed to amplify the rare-
+    class portion of dark knowledge did not transfer.
+
+Three KD attempts on Mamba (KL, UFD, DKD) all marginally worse than
+no-KD baseline on fold 3 within-domain. KD into SSM decoder is not a
+no-op on PanNuke — but the cross-dataset result below is much stronger.
+
+### Phase E — MoNuSeg zero-shot cross-dataset eval
+
+After yesterday's MoNuSeg infrastructure (HF RationAI/MoNuSeg adapter,
+overlap-stitched 256×256 patches), evaluated 5 checkpoints from today's
+training runs on MoNuSeg test (14 images, single-class nuclei).
+
+Critical implementation note: the first sweep attempt was bottlenecked
+on single-threaded post-processing per full-resolution image (1000×1000).
+Each image took 2-5 min sequentially → 6+ hours estimated total. Killed
+and refactored `eval_monuseg.py` to two phases:
+  1. GPU stitching for all images first (fast, sequential, ~6s/14 imgs)
+  2. Pool-parallel post-process + panoptic_quality across images (~10s)
+
+Total per-checkpoint eval (plain + TTA) dropped from ~50 min to ~1 min.
+Whole 5-model sweep finished in ~10 min.
+
+### MoNuSeg results (bPQ TTA, n=14 images)
+
+| Model              | Decoder | KD  | PanNuke fold-3 | MoNuSeg | gap     |
+|--------------------|---------|-----|----------------|---------|---------|
+| hover_ufd          | conv    | UFD | 0.5988         | 0.5563  | −0.0425 |
+| mamba_default      | mamba   | —   | 0.5808         | 0.5702  | −0.0106 |
+| mamba_cs4_d64      | mamba   | —   | 0.5906         | 0.5463  | −0.0443 |
+| mamba_cs4_kl       | mamba   | KL  | 0.5902         | 0.4608  | −0.1294 |
+| mamba_cs4_dkd      | mamba   | DKD | 0.5838         | 0.3763  | **−0.2075** |
+
+(bPQ used because MoNuSeg has no cell-type labels; F1 follows the same
+pattern with the same ranking.)
+
+### Three surprising findings (defensible after this run)
+
+1. **KD into Mamba is catastrophic for domain shift.** KL costs −0.086
+   bPQ TTA on MoNuSeg vs the matched-architecture no-KD baseline; DKD
+   costs −0.170. Within-PanNuke the same KD only costs −0.005 to −0.009.
+   The teacher's confident decision boundary on PanNuke is being
+   memorized by the SSM student in a way that does not survive the
+   stain / scanner / organ shift to MoNuSeg.
+
+2. **Mamba default beats the C3-winning Mamba on MoNuSeg.** cs4_d64_g4
+   was +0.007 mPQ TTA on PanNuke (the C3 winner) but is −0.024 bPQ TTA
+   on MoNuSeg vs the default bi_d16_g4. Classic capacity / generalization
+   trade-off: extra cross-scan + state dimension overfits the in-domain
+   distribution.
+
+3. **Mamba default also beats the conv decoder on MoNuSeg.** mamba_default
+   0.5702 vs hover_ufd 0.5563 (+0.014). On PanNuke they were tied. The
+   PanNuke-equality + MoNuSeg-advantage for Mamba is the closest thing
+   we have to a positive contribution: matched in-domain, better out-of-
+   domain.
+
+### Thesis story re-frame (post-MoNuSeg)
+
+The negative findings of today's session are actually the spine of the
+defense:
+
+  - **Architecture matched-budget ablation (conv vs SSM)** — defensible
+    contribution: decoder choice has measurable consequence on
+    generalization profile, not on in-domain mPQ.
+  - **KD-into-Mamba is not a free lunch** — KL/DKD/UFD all fail to help
+    even when carefully calibrated. Within PanNuke the gap is small;
+    cross-dataset the gap is large and consistent.
+  - **Frequency-decoupled KD adaptation (Novel A)** — clean negative,
+    documented mechanism (LF dominates, HF no-op on segmentation
+    softmax).
+  - **Methodological infrastructure** — seeds, per-image arrays + paired
+    stats, env-driven configs, MoNuSeg HF adapter, ablation grid runner
+    + sweep scripts. All ready for the Phase D 3-fold CV when we run it.
+
+### Statistical caveats
+
+  - All Mamba conditions: **1 fold only** (fold 3). Phase D 3-fold grid
+    needed before any mean±std claim.
+  - MoNuSeg eval: n=14 images. Paired tests at this n have low power;
+    deltas of 0.01-0.02 are not significant. The 0.086 and 0.170 gaps
+    for KD on Mamba ARE likely significant given the magnitude, but a
+    per-image Wilcoxon should be in the thesis appendix.
+
+### What still doesn't have a 3-fold number
+
+  - Mamba no-KD (default + cs4_d64)
+  - Mamba + KL distill (cs4_d64)
+  - Mamba + DKD (cs4_d64)
+  - HoVer + UFD-KD
+  - HoVer + DKD (never tried)
+
+Phase D2 ablation grid would cover all of these.
+
+### Branch state at session end
+
+  - `master`                     4f79123 (origin, unchanged)
+  - `dev/post-master-work`       479ec1b → all today's code + docs
+    (UFD, DKD, Mamba decoder + sweep, hygiene, per-image stats,
+    MoNuSeg via HF including cross-dataset sweep script)
+  - `feat/ablation-grid-runner`  131d486 — D2 grid runner + yaml
+  - `feat/monuseg-eval`          427369a — MoNuSeg adapter + HF migration
+    (mirrored onto dev/ via cherry-pick db46937 + 600e637)
+  - `docs/related-work`          6a97b19 — thesis literature notes

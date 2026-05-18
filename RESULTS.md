@@ -137,11 +137,165 @@ changed the reported numbers:
 ## Next steps
 
 - ~~Full 3-fold cross-validation with `mean ± std`~~ — **done** (this report)
-- External dataset eval on MoNuSeg and CoNSeP for domain-shift robustness
+- ~~External dataset eval on MoNuSeg~~ — **done** (1-fold, see Update below)
+- ~~Decoupled-KD (DKD) targeting Dead-class transfer~~ — **done, did not help**
+  (see Update below)
+- Phase D 3-fold ablation grid: {HoVer, Mamba} × {no-KD, KL, DKD} ×
+  3 folds for full statistical claims on the comparative ablation
 - Feature KD with β in [0.3, 0.5] — original β=1.0 was likely too aggressive
-- Decoupled-KD (DKD) or focal-KD targeting Dead-class transfer
 - Architecture ablation: separate type-head mini-decoder, ASPP block before
   heads, larger final decoder stage (current 32 ch is a likely bottleneck
   for rare classes)
 - Pathology-specific teachers (UNI 2, Virchow 2) instead of SAM-based CellViT
 - Post-training INT8 quantization for ~4× additional compression
+
+
+---
+
+## Update 2026-05-18 — Mamba-decoder + DKD + cross-dataset (1-fold pilot)
+
+All numbers in this section are **fold-3 only** (single experiment), not
+3-fold CV. They are pilot results from a 24-hour session that adds three
+new directions on top of the 3-fold report above. Mean±std claims still
+need the Phase D 3-fold grid; current deltas are reported relative to
+the published fold-3 numbers from the table above.
+
+### 1. Mamba-decoder student (FastViT-S12 + SSM decoder)
+
+Replaced the conv `HoVerNetDecoder` with a Mamba-based decoder
+(UltraLight-VM-UNet style PVM blocks: channels split into G groups,
+independent Mamba layer per group, GroupNorm residual). Two scan
+patterns matter: row-major bidirectional (default) and VMamba 4-way
+cross-scan (`cs4`).
+
+Mamba-decoder architecture sweep (fold-3, 40 epochs, no KD):
+
+| Config        | scan            | d_state | Params  | mPQ TTA |
+|---------------|-----------------|---------|---------|---------|
+| bi_d16_g4     | bidirectional   | 16      | 9.8M    | 0.4650  |
+| bi_d32_g4     | bidirectional   | 32      | 9.9M    | 0.4642  |
+| bi_d64_g4     | bidirectional   | 64      | 10.0M   | 0.4656  |
+| cs4_d16_g4    | cross_scan_4way | 16      | 10.4M   | 0.4670  |
+| cs4_d32_g4    | cross_scan_4way | 32      | 10.5M   | 0.4665  |
+| **cs4_d64_g4**| **cross_scan_4way** | **64** | **10.7M** | **0.4717** |
+| bi_d32_g2     | bidirectional   | 32      | 10.0M   | 0.4630  |
+
+`cs4_d64_g4` is the winning Mamba config. The gain comes from the
+**interaction** of cross-scan + larger state (each alone gives
++0.001-0.002 mPQ; together +0.007). `groups=2` (wider per-group
+channels) is the worst configuration of the sweep — narrower groups
+beat wider for this size.
+
+### 2. Mamba vs conv decoder (matched budget)
+
+| Decoder       | Params | mPQ TTA fold-3 | Δ vs HoVer  |
+|---------------|--------|----------------|-------------|
+| HoVer (conv)  | 11.5M  | 0.4720*        | reference   |
+| Mamba cs4_d64 | 10.7M  | 0.4717         | −0.0003     |
+
+(*from fold-3 of the 3-fold-CV baseline above.)
+
+**Mamba decoder essentially ties the conv decoder on PanNuke at matched
+budget, with 0.8M fewer parameters.** Gap is within 1σ of the 3-fold std
+(±0.0023). This is the first matched-budget result on PanNuke nuclei
+segmentation for an SSM-based decoder in the ≤15M regime.
+
+### 3. KD on Mamba (fold-3 1-fold runs)
+
+Same cs4_d64_g4 Mamba decoder, three KD variants tested:
+
+| Condition    | KD method     | mPQ TTA | Δ vs Mamba no-KD |
+|--------------|---------------|---------|------------------|
+| Mamba cs4_d64 (ref) | none   | 0.4717  | —                |
+| Mamba + KL   | KL, α=0.05, T=10 | 0.4664  | −0.0053          |
+| Mamba + DKD  | DKD, α=1, β=8    | 0.4631  | −0.0086          |
+| HoVer + UFD-KD | UFD-KD (cf. §4) | 0.4725 | +0.0008 (tie)    |
+
+**All three KD attempts on Mamba are marginally worse than no-KD
+within PanNuke** (1-fold; differences are 1-4σ of the 3-fold std).
+KL and DKD response distillation, both tuned on HoVer + conv decoder,
+do not transfer to the SSM decoder at the same hyperparameters.
+A dedicated α/T sweep for Mamba is open work.
+
+### 4. Frequency-Decoupled KD (Novel A) — clean negative
+
+Adapted UFD-KD (Lu et al., BMVC 2025) from classification to dense
+prediction: per-pixel softmax → 2D DCT-II → split into LF/HF bands →
+weighted MSE. Result (HoVer decoder, fold 3, α=5×10⁻⁴ after T²
+calibration):
+
+| Condition          | mPQ TTA | Dead PQ TTA |
+|--------------------|---------|-------------|
+| HoVer + KL distill (ref, 3-fold avg) | 0.4695 | 0.1635 |
+| HoVer + UFD-KD     | 0.4725  | 0.1357 (−17%) |
+
+Within noise on mPQ, but Dead class **drops 17% relative**. Inspection
+of per-band loss magnitudes during training: LF MSE ≈ 12, HF MSE ≈
+0.02 → with `hf_weight=3` the HF contribution to total is 0.5%. The
+intended "frequency decoupling" is effectively a no-op on segmentation
+softmax. Negative result documented; the adaptation does not survive
+the magnitude imbalance.
+
+### 5. Cross-dataset zero-shot eval (MoNuSeg test, n=14)
+
+Loaded RationAI/MoNuSeg from HuggingFace, ran 5 today's checkpoints
+zero-shot with overlap-stitched 256×256 patches and 4-way flip TTA.
+
+| Model         | Decoder | KD  | PanNuke bPQ TTA | MoNuSeg bPQ TTA | gap     |
+|---------------|---------|-----|-----------------|-----------------|---------|
+| hover_ufd     | conv    | UFD | 0.5988          | 0.5563          | −0.043  |
+| mamba_default | mamba   | —   | 0.5808          | 0.5702          | −0.011  |
+| mamba_cs4_d64 | mamba   | —   | 0.5906          | 0.5463          | −0.044  |
+| mamba_cs4_kl  | mamba   | KL  | 0.5902          | 0.4608          | **−0.129** |
+| mamba_cs4_dkd | mamba   | DKD | 0.5838          | 0.3763          | **−0.208** |
+
+(MoNuSeg has only nucleus-vs-background labels, so only bPQ is
+applicable — F1-detection follows the same ranking.)
+
+**Three findings from this run:**
+
+1. **KD on Mamba is catastrophic under domain shift.** Within PanNuke
+   the KL/DKD penalty was 0.005-0.009 mPQ; on MoNuSeg the same KL/DKD
+   models lose 0.086-0.170 bPQ vs the matched-architecture no-KD
+   baseline. The teacher's PanNuke-specific decision boundary appears
+   to be memorized by the SSM student in a way that does not survive
+   the stain / scanner / organ shift.
+
+2. **Mamba default generalizes best.** The "weakest" Mamba on PanNuke
+   (bi_d16_g4, mPQ 0.4650) is the strongest on MoNuSeg (bPQ 0.5702).
+   The C3-winning cs4_d64_g4 (+0.007 mPQ on PanNuke) is −0.024 bPQ on
+   MoNuSeg vs the default. Capacity / generalization trade-off.
+
+3. **Mamba default beats conv decoder on MoNuSeg.** mamba_default 0.5702
+   vs hover_ufd 0.5563 (+0.014 bPQ). On PanNuke they were tied. This is
+   the closest result to a clean positive contribution in the session.
+
+### Reproducibility artefacts (Update)
+
+- Code: branches `dev/post-master-work`, `feat/ablation-grid-runner`,
+  `feat/monuseg-eval`, `docs/related-work` (not merged to `master`).
+- Run dirs (1-fold each, NOT in git — gitignored):
+  - `logs/ufd_final/runs/distill_fastvit_s12_20260517_191745/` (Phase A)
+  - `logs/mamba_baseline/runs/baseline_fastvit_s12_20260517_210340/` (Mamba default)
+  - `logs/c3_sweep/runs/{bi,cs4}_d{16,32,64}_g{2,4}_baseline_*/` (C3 sweep)
+  - `logs/c4_mamba_kl/runs/distill_fastvit_s12_20260518_071225/` (Mamba+KL)
+  - `logs/c4_mamba_dkd/runs/distill_fastvit_s12_20260518_085801/` (Mamba+DKD)
+- Per-image arrays (npz) saved alongside each `eval_*.json` (PanNuke + MoNuSeg).
+- Sweep summaries: `logs/c3_sweep/summary.tsv`, `logs/monuseg_sweep/summary.tsv`.
+- Lit notes: `docs/related-work.md`.
+- Reproducible: `scripts/c3_mamba_sweep.sh`, `scripts/e_monuseg_sweep.sh`,
+  `grids/main_ablation.yaml` (for the Phase D 3-fold grid runner).
+
+### Caveats for the thesis
+
+  - All Mamba and Phase E results are **1-fold (fold 3)**. The 0.0043
+    headline KD improvement above survives 3-fold CV; the Mamba-equals-
+    HoVer claim and the KD-hurts-Mamba claim do not have multi-fold
+    confirmation yet. Phase D2 grid (18 runs) is the right
+    follow-up.
+  - MoNuSeg n=14: the 0.014 advantage of mamba_default over hover_ufd
+    is on the edge of significance; the 0.086 and 0.170 gaps for KD-on-
+    Mamba are large enough to almost certainly hold.
+  - Teacher reference number 0.592 vs paper-reported 0.510 still
+    unresolved (likely protocol difference — to be reconciled before
+    quoting "79 % of teacher quality").

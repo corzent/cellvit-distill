@@ -15,8 +15,9 @@ Output: JSON with {bPQ, F1_detection, per_image_bpq, per_image_f1} and a
 Usage:
     python -m cellvit_distill.scripts.eval_monuseg \\
         --run_dir cellvit_distill/runs/distill_fastvit_s12_... \\
-        --monuseg_dir datasets/monuseg/test \\
-        [--tta] [--stride 128]
+        [--split test] [--tta] [--stride 128]
+
+The first invocation downloads RationAI/MoNuSeg (~96 MB) into HF cache.
 """
 
 import argparse
@@ -86,7 +87,7 @@ def _stitch_image(model, ds: MoNuSegDataset, img_idx: int, device,
 
     Returns (binary_prob, hv_map, gt_instance) all at full image resolution.
     """
-    img, gt = ds._load(img_idx)
+    img, gt, _patient, _tissue = ds._load(img_idx)
     H, W = img.shape[:2]
     ps = ds.patch_size
     stride = ds.stride
@@ -124,8 +125,10 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--run_dir", type=Path, required=True)
     p.add_argument("--checkpoint", type=str, default="best_model.pth")
-    p.add_argument("--monuseg_dir", type=Path, required=True,
-                   help="Path to monuseg split (contains images/, masks/)")
+    p.add_argument("--split", default="test", choices=("train", "test"),
+                   help="HF dataset split (default: test, n=14 images)")
+    p.add_argument("--cache_dir", default=None,
+                   help="HF cache dir; defaults to $HF_HOME or ~/.cache/huggingface")
     p.add_argument("--patch_size", type=int, default=256)
     p.add_argument("--stride", type=int, default=128)
     p.add_argument("--tta", action="store_true",
@@ -149,9 +152,10 @@ def main() -> int:
     print(f"Student: {cfg['student']['encoder']} ({info['total_M']:.1f}M params)")
     print(f"Checkpoint: epoch {ckpt['epoch']}")
 
-    ds = MoNuSegDataset(args.monuseg_dir, patch_size=args.patch_size,
-                        stride=args.stride, load_masks=True)
-    print(f"MoNuSeg: {ds.num_images} images, {len(ds)} patches")
+    ds = MoNuSegDataset(split=args.split, patch_size=args.patch_size,
+                        stride=args.stride, cache_dir=args.cache_dir,
+                        load_masks=True)
+    print(f"MoNuSeg ({args.split}): {ds.num_images} images, {len(ds)} patches")
 
     per_image_bpq = []
     per_image_f1 = []
@@ -173,7 +177,7 @@ def main() -> int:
                 r = panoptic_quality(pred_inst, gt)
                 per_image_bpq.append(r["PQ"])
                 per_image_f1.append(r["DQ"])
-                image_names.append(ds._image_files[img_idx].stem)
+                image_names.append(ds.image_names()[img_idx])
     finally:
         pool.close()
         pool.join()

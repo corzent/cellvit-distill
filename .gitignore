@@ -20,6 +20,8 @@ logs/smoke_*/
 logs/ufd_*/
 logs/mamba_*/
 logs/sweep_*/
+logs/c3_sweep/
+logs/c4_*/
 .hf_home*/
 *.log
 

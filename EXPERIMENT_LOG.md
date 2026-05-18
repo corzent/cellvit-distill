@@ -445,3 +445,231 @@ python -m cellvit_distill.scripts.train --config configs/fastvit_nulite_v2.yaml 
 - CellViT++: PubMed 41576779 (2025). Foundation models + lightweight.
 - HoVer-Net (baseline): Graham et al., Medical Image Analysis (2019).
 - CellViT (teacher): Hörst et al., Medical Image Analysis (2024).
+
+
+---
+
+## 2026-05-17–18 — Direction expansion: Mamba decoder + DKD + UFD-KD probe
+
+Long session spanning two days. Goal: stress-test the master pipeline by
+adding three new directions before any thesis writeup is finalized:
+
+  1. **Novel A** — adapt UFD-KD (Lu et al. BMVC 2025) from classification
+     to dense prediction.
+  2. **Comparative KD ablation** — add Decoupled KD (Zhao CVPR 2022) as
+     a third method alongside KL and UFD.
+  3. **Mamba-decoder student** — replace conv decoder with SSM, motivated
+     by linear-complexity claim and the empty cell "KD-into-Mamba for
+     nuclei seg" in the literature.
+
+### Setup hygiene
+
+Before any new experiments:
+
+- `train.py`: deterministic seeds (torch / cuda / numpy / random /
+  PYTHONHASHSEED, default 42). Does not toggle cudnn.deterministic — the
+  ~20% slowdown isn't worth it; std reported across folds is still real
+  fold variance, not RNG.
+- `train.py`: load_config now expands `${ENV_VAR}` and
+  `${ENV_VAR:-fallback}` in string values. All 5 configs migrated from
+  `/home/corzent/caspian/thesis/...` to env-driven defaults. Repo now
+  runs from a fresh clone with `uv sync && bash run_experiments.sh`.
+- `metrics.py + eval_student.py`: optional per-image PQ arrays
+  (`return_per_image=True`). Splits scalars (json) from per-image arrays
+  (npz). Enables paired Wilcoxon and bootstrap CI on per-image deltas.
+- `scripts/stat_test.py`: paired t / Wilcoxon / 10k bootstrap CI +
+  Cohen's d. Verified on existing 3-fold numbers from RESULTS.md:
+  paired t p=0.036 (significant), Wilcoxon p=0.25 (not — n=3 is too
+  small for Wilcoxon's rank sum). **First defensibility finding of the
+  session:** the published headline mean±std is not statistically
+  conservative; per-image arrays + bootstrap CI are required for the
+  Phase D grid.
+
+### Phase 0 — Mamba literature scout
+
+Before committing to Mamba-decoder work, scouted the field. Key result:
+
+- **CP-Mamba (AAAI 2025, arXiv 2503.10422)** already published Mamba
+  encoder-decoder on PanNuke with **mPQ 0.6149** — above our teacher
+  under our protocol. The "first Mamba on PanNuke" claim is gone.
+- **No prior work** distills a transformer/conv teacher into a Mamba-
+  decoder student for nuclei (or any other) instance segmentation on
+  histopathology. This is the defensible novelty slice.
+- **HoVer-UNet (arXiv 2311.12553)** is the only prior KD-on-nuclei-seg
+  work — direct KD-on-conv baseline for the ablation.
+- **UltraLight VM-UNet (Wu et al. 2024, arXiv 2403.20035)** is the
+  architecture template for our Mamba decoder (PVM block — channels
+  split into G groups, independent Mamba per group, concat + GroupNorm).
+
+Decision (with user 2026-05-17): half-pivot. Mamba is one contribution
+not the headline; CP-Mamba cited not reproduced; story is comparative
+ablation `{conv, SSM} × {no-KD, KL, DKD}` at fixed FastViT-S12 encoder
+and ≤15M cap. Full notes: `docs/related-work.md`.
+
+### Novel A — Frequency-Decoupled KD
+
+UFD-KD adapted to dense prediction in `losses.py:FrequencyDecoupledDistillLoss`:
+  - Per-pixel softmax → 2D DCT-II (Dh @ x @ Dw^T, two batched matmuls)
+  - Split DCT into LF (top-left K×K) and HF (residual), weighted MSE
+  - Default lf_size=32, lf_weight=1, hf_weight=3, T²-scaled
+
+**Smoke (1 epoch, fold 1):** loss runs end-to-end with bf16/fp16, but
+the band magnitudes are **lf ≈ 12, hf ≈ 0.02** for the binary head
+(softmax over 2 classes). With `hf_weight=3`, HF contribution is 0.5%
+of total — the intended frequency decoupling is effectively a no-op.
+T² scaling at T=10 also blows the loss up by 100×, requiring α to drop
+from the master 0.05 to ~5×10⁻⁴.
+
+**Phase A 1-fold (fold 3, 60 ep, α=5×10⁻⁴, T=10):** Best mPQ=0.4658
+plain / 0.4725 TTA at epoch 48. Versus master KL distill (fold 3):
+**plain −0.0037, TTA +0.0030** — within 1 std (±0.0023). Per-class TTA
+**Dead = 0.1357 vs master KL 0.1635 (−17%)** — the hypothesized rare-
+class benefit did NOT materialize. The HF-band-no-op smoke prediction
+was correct: UFD here is effectively LF-only MSE on softmax, not the
+band-decoupled KL we wanted.
+
+**Verdict:** abandoned hypothesis but a clean negative result that
+informs the thesis discussion. Code, tests, and per-image arrays kept
+on `dev/post-master-work` for reproducibility.
+
+### Phase D1 — Decoupled KD (Zhao CVPR 2022)
+
+`losses.py:DecoupledDistillLoss`:
+  - TCKD: binary KL on (p(target), 1 − p(target))
+  - NCKD: KL on non-target subspace after renormalization
+  - Default α=1.0, β=8.0 (paper recommends β ≫ α to amplify NCKD)
+  - Numerical path uses `full_KL − tgt_KL` to avoid `log(0)` from
+    masked-softmax
+  - Wired through `DistillationLoss(loss_type='dkd', dkd_alpha=...,
+    dkd_beta=...)` and `CombinedLoss` kwargs
+  - Per-pixel target = teacher argmax (keeps DistillationLoss signature
+    unchanged — no GT map argument)
+
+Sanity tests in `tests/test_dkd.py` (11 checks, all pass). Magnitudes
+(T=4, C=6): standard KL × T² = 0.835, DKD α=β=1 = 0.988, TCKD = 0.020,
+NCKD = 0.042. At paper defaults α=1, β=8: DKD ≈ 0.36 — same order as
+KL baseline. **Existing α=0.05 outer-KD weight works without
+recalibration**, unlike UFD which needed ~10000× retuning.
+
+### Phase C — Mamba decoder
+
+Code (`cellvit_distill/models/mamba_decoder.py`):
+  - `MambaDecoder` mirrors `HoVerNetDecoder` interface (drop-in via
+    `student.decoder_type='mamba'`).
+  - `MambaBlock` supports 3 scan patterns: `fwd`, `bidirectional`,
+    `cross_scan_4way` (VMamba SS2D style — row fwd + row rev + col fwd
+    + col rev, averaged).
+  - `PVMBlock`: channels split into G groups, independent MambaBlock per
+    group + GroupNorm residual.
+  - Mamba1 (v1) and Mamba2 (v2) paths via `_try_import_mamba(version)`.
+    Both fall through to a CPU placeholder when `mamba_ssm` isn't
+    installed — lets architecture iteration happen before env setup.
+
+**Env on RTX 5090 (sm_120) + CUDA 13 + PyTorch 2.12:** scout warned 2-3
+days for source build; actual build took **~25 min** with default
+`uv pip install --no-build-isolation`. Pip had to be installed into
+the uv-venv first (`uv pip install --python .venv/bin/python pip`),
+then `causal-conv1d 1.6.2.post1` and `mamba-ssm 2.3.2.post1` compiled
+cleanly with all gencodes including sm_120. End-to-end Mamba-decoder
++ FastViT-S12 + 3 HoVer heads forward pass: bf16 stable, no NaN.
+
+**C2 stability smoke (2 ep, fold 1):** train loss 11.6 → 8.88
+monotonically. Model 9.8M total (8.3M encoder + 1.4M decoder + 0.03M
+heads + tissue head). Speed comparable to conv decoder at the same
+batch.
+
+**C4 Mamba baseline 1-fold (fold 3, default config — bi/v1/d_state=16/
+groups=4):** mPQ 0.4531 plain / 0.4650 TTA. **Worse than HoVer baseline
+0.4668 plain on fold 3 by 0.014.** Per-class TTA Dead = 0.1189
+vs HoVer ~0.168 = −30% relative. Decoder is 1.4M vs HoVer's 3.1M —
+under-parameterized at the default Mamba config.
+
+**C3 architecture sweep (6 configs × fold 3, 40 ep each):**
+
+| Config       | scan            | d_state | groups | mPQ plain | mPQ TTA |
+|--------------|-----------------|---------|--------|-----------|---------|
+| bi_d16_g4    | bidirectional   | 16      | 4      | 0.4531    | 0.4650  |
+| bi_d32_g4    | bidirectional   | 32      | 4      | 0.4538    | 0.4642  |
+| bi_d64_g4    | bidirectional   | 64      | 4      | 0.4566    | 0.4656  |
+| cs4_d16_g4   | cross_scan_4way | 16      | 4      | 0.4533    | 0.4670  |
+| cs4_d32_g4   | cross_scan_4way | 32      | 4      | 0.4554    | 0.4665  |
+| **cs4_d64_g4** | **cross_scan_4way** | **64** | **4** | **0.4611** | **0.4717** |
+| bi_d32_g2    | bidirectional   | 32      | 2      | 0.4555    | 0.4630  |
+
+  - `groups=2` (wider per-group dim) HURTS — worst of the sweep.
+  - `cross_scan_4way` alone gives +0.001–0.002 mPQ TTA.
+  - `d_state` alone gives +0.001 mPQ TTA per step.
+  - **Combined cs4 + d_state=64 → +0.007** over default. Non-linear
+    synergy. Total student 10.7M with this config (under ≤15M cap).
+
+**Headline:** `cs4_d64_g4` Mamba decoder ties HoVer baseline 0.4720 on
+mPQ TTA fold 3 (gap −0.0003 within noise). First matched-budget
+demonstration that Mamba decoder is viable for PanNuke nuclei seg in
+the lightweight regime.
+
+### Phase C4 — Mamba + KL distill (1-fold sanity)
+
+Using winning Mamba config (cs4_d64_g4, 10.7M) + master KL distill
+recipe (α=0.05, T=10, head_weights bin=1 hv=0 type=1):
+
+  - Best mPQ plain = 0.4584 (vs Mamba no-KD 0.4611, **−0.003**)
+  - Best mPQ TTA = 0.4664 (vs Mamba no-KD 0.4717, **−0.005**)
+  - Dead PQ TTA = 0.1114 (vs Mamba no-KD ~similar)
+
+**KL distill on Mamba is marginally negative.** Three readings:
+
+  1. Real: SSM gradient dynamics don't accept KD signal the same way
+     conv gradients do.
+  2. Hyperparameter mismatch: α/T tuned for HoVer 11.5M conv; Mamba
+     10.7M SSM might need different (sweep is open work).
+  3. Fold noise: −0.005 vs std ±0.0023 = ~2σ. Borderline.
+
+Cannot distinguish (1)–(3) from one fold. Phase D 3-fold grid + B5
+Mamba α/T sweep are the open follow-ups.
+
+### Snapshot — fold 3 1-fold runs only (TTA where listed)
+
+| Run                              | Decoder | KD       | mPQ TTA  | Notes |
+|----------------------------------|---------|----------|----------|-------|
+| HoVer baseline (master CV avg)   | conv    | none     | ≈0.4720  | fold 3 from 3-fold CV |
+| HoVer + KL distill (master CV)   | conv    | KL       | 0.4695   | fold 3 from 3-fold CV |
+| HoVer + UFD-KD (Phase A)         | conv    | UFD      | 0.4725   | 1-fold, abandoned |
+| Mamba cs4_d64 no-KD (C3)         | mamba   | none     | 0.4717   | 1-fold, ties HoVer |
+| Mamba cs4_d64 + KL (C4)          | mamba   | KL       | 0.4664   | 1-fold, KD HURTS |
+
+All on fold 3 only. **No statistical claim is defensible until the
+Phase D 3-fold grid completes** — current numbers are ±0.005 of each
+other and std across 3 folds is ±0.0023 → most differences are within
+noise.
+
+### What today does NOT settle (open work)
+
+  - **DKD on Mamba** — currently launched as 1-fold. Will tell whether
+    DKD picks up where KL doesn't.
+  - **B4 teacher reference gap** — 0.51 paper vs 0.592 our eval is still
+    unresolved. Needed before we can quote "79% of teacher quality".
+  - **B5 α/T sweep on Mamba** — separate from HoVer sweep, distinct
+    optimization surface.
+  - **D2 3-fold ablation grid** — 6 conditions × 3 folds = 18 runs,
+    needed for any headline mean±std claim.
+  - **MoNuSeg cross-dataset eval** — infrastructure ready
+    (`feat/monuseg-eval`), needs MoNuSeg download + winning model from
+    Phase D.
+  - **Phase F polish** — RESULTS.md headline rewrite once 3-fold numbers
+    are in.
+
+### Branch state (eight git heads, all built today)
+
+  - `master`             4f79123 (origin, unchanged)
+  - `dev/post-master-work` 17eef13 → contains UFD impl + post-review
+    fixes, DKD impl, Mamba decoder + sweep script, hygiene (seeds +
+    paths), per-image stats util, MambaDecoder wired into build_student.
+  - `feat/ablation-grid-runner` 131d486 — D2 grid runner + main_ablation
+    yaml (6 conditions × 3 folds).
+  - `feat/monuseg-eval`  d051657 — MoNuSeg adapter + download +
+    binary eval CLI with overlap stitching.
+  - `docs/related-work`  6a97b19 — thesis literature notes.
+
+Mixed-history on `dev/post-master-work` is acknowledged debt (user
+flagged it; we chose rename-vs-resplit; per-commit each entry stays
+atomic and cherry-pickable).

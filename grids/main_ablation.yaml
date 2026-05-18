@@ -1,0 +1,72 @@
+# Main 3-fold ablation grid for the thesis comparative study.
+#
+# Encoder is fixed (FastViT-S12) and budget capped at ≤15M params. Two
+# decoders × three KD signals × three folds = 18 runs.
+#
+# Note: mamba-decoder conditions assume student.decoder_type=mamba is wired
+# in build_student (Phase C2 work). When that's not present yet, only the
+# `*_hover` conditions execute; mamba ones will fail loudly.
+
+base_config: cellvit_distill/configs/fastvit_nulite_v2.yaml
+
+folds: [1, 2, 3]
+
+common_overrides:
+  - training.epochs=130
+  - training.warmup_epochs=10
+  - training.early_stop_patience=20
+  - training.val_every_n_epochs=2
+  - logging.wandb=false
+  - logging.save_checkpoint_every=999
+
+conditions:
+
+  # ---------- Convolutional decoder (HoVer-Net style) ----------
+
+  - name: baseline_hover
+    overrides:
+      - training.distillation.enabled=false
+
+  - name: distill_kl_hover
+    overrides:
+      - training.distillation.enabled=true
+      - training.distillation.loss_type=kl_div
+      - training.distillation.alpha=0.05
+      - training.distillation.temperature=10.0
+
+  - name: distill_dkd_hover
+    overrides:
+      - training.distillation.enabled=true
+      - training.distillation.loss_type=dkd
+      - training.distillation.alpha=0.05
+      - training.distillation.temperature=10.0
+      - training.distillation.dkd_alpha=1.0
+      - training.distillation.dkd_beta=8.0
+
+  # ---------- Mamba (SSM) decoder ----------
+
+  - name: baseline_mamba
+    overrides:
+      - student.decoder_type=mamba
+      - training.amp_dtype=bf16
+      - training.distillation.enabled=false
+
+  - name: distill_kl_mamba
+    overrides:
+      - student.decoder_type=mamba
+      - training.amp_dtype=bf16
+      - training.distillation.enabled=true
+      - training.distillation.loss_type=kl_div
+      - training.distillation.alpha=0.05
+      - training.distillation.temperature=10.0
+
+  - name: distill_dkd_mamba
+    overrides:
+      - student.decoder_type=mamba
+      - training.amp_dtype=bf16
+      - training.distillation.enabled=true
+      - training.distillation.loss_type=dkd
+      - training.distillation.alpha=0.05
+      - training.distillation.temperature=10.0
+      - training.distillation.dkd_alpha=1.0
+      - training.distillation.dkd_beta=8.0

@@ -22,6 +22,7 @@ logs/mamba_*/
 logs/sweep_*/
 logs/c3_sweep/
 logs/c4_*/
+logs/monuseg_sweep/
 .hf_home*/
 *.log
 

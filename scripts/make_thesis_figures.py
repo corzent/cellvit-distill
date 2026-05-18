@@ -340,26 +340,33 @@ def fig_training_curves():
 # ---------- 5. Results comparison ----------
 def fig_results_comparison():
     print("  [5/7] results comparison")
-    # Final numbers from all our evals
+    # Final 3-fold CV numbers (all TTA where applicable).
+    # NuLite-T released ckpt evaluated on our protocol across all 3 folds
+    # (logs/nulite_eval/) — mean of 0.6003 / 0.5913 / 0.5921 = 0.595.
+    # Hybrid B: NuLite-T architecture trained on our 3-fold protocol —
+    # only fold 1 done so far (0.4804 TTA, logs/hybrid_b/), so labelled.
     models = [
         "CellViT-SAM-H\n(teacher, 630M)",
+        "NuLite-T released\n(12M, Hybrid A)",
         "CellViT-256\n(x20, 46.8M)",
-        "ConvNeXt-Tiny\n(31.9M)",
-        "FastViT baseline\n(11.5M)",
-        "FastViT + response KD\n(11.5M)",
-        "FastViT + feature KD\n(11.8M)",
-        "★ FastViT + KD + TTA\n(11.5M)",
+        "ConvNeXt-Tiny\n(31.9M, fold 3)",
+        "Hybrid B fold 1\n(12M, NuLite-T arch)",
+        "FastViT baseline\n(11.5M, 3-fold CV)",
+        "★ FastViT + KD + TTA\n(11.5M, 3-fold CV)",
     ]
-    mpq = [0.592, 0.317, 0.468, 0.456, 0.467, 0.461, 0.472]
-    bpq = [0.664, 0.471, 0.591, 0.578, 0.598, 0.591, 0.604]
-    f1  = [0.784, 0.598, 0.719, 0.706, 0.724, 0.720, 0.729]
+    mpq = [0.592, 0.595, 0.317, 0.468, 0.480, 0.466, 0.470]
+    bpq = [0.664, 0.648, 0.471, 0.591, 0.596, 0.590, 0.599]
+    f1  = [0.784, 0.772, 0.598, 0.719, 0.724, 0.716, 0.725]
+    # std for the two 3-fold CV columns; others single-fold or paper numbers
+    mpq_err = [0, 0.005, 0, 0, 0, 0.0024, 0.0023]
 
     x = np.arange(len(models))
     width = 0.27
 
-    fig, ax = plt.subplots(figsize=(14, 6))
+    fig, ax = plt.subplots(figsize=(15, 6))
     b1 = ax.bar(x - width, mpq, width, label="mPQ",
-                color=PALETTE["accent"], edgecolor=PALETTE["ink"], linewidth=0.5)
+                color=PALETTE["accent"], edgecolor=PALETTE["ink"], linewidth=0.5,
+                yerr=mpq_err, error_kw=dict(ecolor=PALETTE["ink"], capsize=3, capthick=0.8))
     b2 = ax.bar(x,         bpq, width, label="bPQ",
                 color=PALETTE["green"],  edgecolor=PALETTE["ink"], linewidth=0.5)
     b3 = ax.bar(x + width, f1,  width, label="F1-детекции",
@@ -373,7 +380,7 @@ def fig_results_comparison():
 
     ax.set_xticks(x); ax.set_xticklabels(models, fontsize=9.5)
     ax.set_ylabel("Значение метрики")
-    ax.set_title("Сравнение моделей по трём метрикам (PanNuke fold 3)")
+    ax.set_title("Сравнение моделей по трём метрикам (PanNuke, единый eval pipeline)")
     ax.set_ylim(0, 0.92)
     ax.legend(loc="upper right", fontsize=11)
     # Highlight the best student row
@@ -387,34 +394,42 @@ def fig_results_comparison():
 # ---------- 6. Per-class PQ ----------
 def fig_per_class_pq():
     print("  [6/7] per-class PQ")
+    # Teacher: fold 3 single, ours: 3-fold CV mean (TTA).
+    # NuLite-T released: mean across 3 folds from logs/nulite_eval/.
     classes = ["Neoplastic", "Inflammatory", "Connective", "Dead", "Epithelial"]
-    teacher = [0.668, 0.576, 0.516, 0.443, 0.670]
-    baseline = [0.530, 0.449, 0.385, 0.158, 0.531]
-    distill  = [0.550, 0.446, 0.384, 0.104, 0.544]
-    feature  = [0.553, 0.428, 0.381, 0.137, 0.545]
+    teacher        = [0.668, 0.576, 0.516, 0.443, 0.670]
+    nulite_release = [0.662, 0.585, 0.521, 0.475, 0.653]
+    baseline       = [0.529, 0.444, 0.389, 0.168, 0.522]
+    distill        = [0.535, 0.447, 0.390, 0.164, 0.537]
+    # std (sample, n=3) for baseline/distill, just on the 3-fold CV pair
+    baseline_err = [0.0150, 0.0164, 0.0040, 0.0436, 0.0054]
+    distill_err  = [0.0163, 0.0162, 0.0077, 0.0362, 0.0150]
+    feature      = None  # excluded — single-fold pilot, not 3-fold
 
     x = np.arange(len(classes))
     w = 0.2
-    fig, ax = plt.subplots(figsize=(12, 5.5))
+    fig, ax = plt.subplots(figsize=(13, 5.5))
 
-    ax.bar(x - 1.5 * w, teacher,  w, label="Teacher (CellViT-SAM-H)",
+    ax.bar(x - 1.5 * w, teacher,        w, label="Teacher (CellViT-SAM-H, fold 3)",
            color=PALETTE["ink"], edgecolor=PALETTE["ink"], linewidth=0.5)
-    ax.bar(x - 0.5 * w, baseline, w, label="FastViT baseline",
-           color=PALETTE["muted"], edgecolor=PALETTE["ink"], linewidth=0.5)
-    ax.bar(x + 0.5 * w, distill,  w, label="FastViT + response KD",
-           color=PALETTE["accent"], edgecolor=PALETTE["ink"], linewidth=0.5)
-    ax.bar(x + 1.5 * w, feature,  w, label="FastViT + feature KD",
+    ax.bar(x - 0.5 * w, nulite_release, w, label="NuLite-T released (3-fold mean)",
            color=PALETTE["green"], edgecolor=PALETTE["ink"], linewidth=0.5)
+    ax.bar(x + 0.5 * w, baseline,       w, label="FastViT baseline (3-fold CV)",
+           color=PALETTE["muted"], edgecolor=PALETTE["ink"], linewidth=0.5,
+           yerr=baseline_err, error_kw=dict(ecolor=PALETTE["ink"], capsize=2, capthick=0.6))
+    ax.bar(x + 1.5 * w, distill,        w, label="FastViT + response KD (3-fold CV)",
+           color=PALETTE["accent"], edgecolor=PALETTE["ink"], linewidth=0.5,
+           yerr=distill_err, error_kw=dict(ecolor=PALETTE["ink"], capsize=2, capthick=0.6))
 
     ax.set_xticks(x); ax.set_xticklabels(classes)
     ax.set_ylabel("Panoptic Quality (PQ)")
-    ax.set_title("PQ по классам клеточных ядер (fold 3)")
+    ax.set_title("PQ по классам клеточных ядер (PanNuke, 3-fold CV / released ckpt eval)")
     ax.legend(loc="upper right", fontsize=10, framealpha=0.9)
     ax.set_ylim(0, 0.85)
 
     # annotate dead column with arrow noting gap
     ax.annotate("Большой gap на редком классе (<2% патчей)",
-                xy=(3, 0.44), xytext=(3.0, 0.75),
+                xy=(3, 0.46), xytext=(3.0, 0.78),
                 fontsize=9.5, color=PALETTE["muted"], style="italic",
                 ha="center",
                 arrowprops=dict(arrowstyle="->", color=PALETTE["muted"], lw=0.8))

@@ -70,91 +70,94 @@ def _arrow(ax, x1, y1, x2, y2, color=None, label=None, lw=1.5, style="->"):
 
 
 # ============================================================
-# 08. Pipeline diagram
+# 08. Pipeline diagram — clean layout: offline top, online bottom,
+# cache flows down via a single vertical bridge.
 # ============================================================
 def fig_pipeline():
     print("  [08] pipeline diagram")
-    fig, ax = plt.subplots(figsize=(14, 6.5))
-    ax.set_xlim(0, 14); ax.set_ylim(0, 6.5); ax.axis("off")
+    fig, ax = plt.subplots(figsize=(16, 8))
+    ax.set_xlim(0, 16); ax.set_ylim(0, 8); ax.axis("off")
 
-    # Title
-    ax.text(7, 6.2, "Сквозной пайплайн обучения с дистилляцией знаний",
-            ha="center", fontsize=14, fontweight="bold", color=PALETTE["ink"])
+    ax.text(8, 7.6, "Сквозной пайплайн обучения с дистилляцией знаний",
+            ha="center", fontsize=15, fontweight="bold", color=PALETTE["ink"])
 
-    # Offline teacher precompute (top row)
-    ax.text(0.2, 5.4, "ОФФЛАЙН  ·  один раз", fontsize=10, fontweight="bold",
-            color=PALETTE["muted"], style="italic")
-    _box(ax, 0.5, 4.4, 2.0, 0.7, "PanNuke\n7901 патч 256×256",
+    # --- OFFLINE row (y ≈ 6) ---
+    ax.text(0.3, 6.85, "ОФФЛАЙН  ·  один раз",
+            fontsize=11, fontweight="bold", color=PALETTE["muted"], style="italic")
+
+    _box(ax, 0.6, 5.7, 2.6, 0.9, "PanNuke\n7901 патч 256×256",
          color=PALETTE["softnavy"], edge=PALETTE["navy"])
-    _arrow(ax, 2.5, 4.75, 3.4, 4.75)
-    _box(ax, 3.4, 4.4, 2.4, 0.7, "Teacher\nCellViT-SAM-H (630M)",
-         color=PALETTE["softred"], edge=PALETTE["accent"], bold=True)
-    _arrow(ax, 5.8, 4.75, 6.7, 4.75)
-    _box(ax, 6.7, 4.4, 2.2, 0.7, "Soft targets\nна диск (fp16)",
+    _arrow(ax, 3.2, 6.15, 4.2, 6.15, lw=1.6)
+    _box(ax, 4.2, 5.7, 3.4, 0.9, "Teacher\nCellViT-SAM-H (630M)",
+         color=PALETTE["softred"], edge=PALETTE["accent"], bold=True, lw=1.8)
+    _arrow(ax, 7.6, 6.15, 8.6, 6.15, lw=1.6)
+    _box(ax, 8.6, 5.7, 3.0, 0.9, "Soft targets\nна диск (fp16)",
+         color=PALETTE["softnavy"], edge=PALETTE["navy"], bold=True)
+
+    # Separator
+    ax.plot([0.3, 15.7], [5.0, 5.0], color=PALETTE["rule"],
+            linestyle="--", linewidth=0.9, zorder=0)
+
+    # --- ONLINE row (y ≈ 3) ---
+    ax.text(0.3, 4.55, "ОНЛАЙН  ·  каждая итерация",
+            fontsize=11, fontweight="bold", color=PALETTE["muted"], style="italic")
+
+    # Inputs
+    _box(ax, 0.6, 2.9, 1.7, 0.9, "Батч\nпатчей",
          color=PALETTE["softnavy"], edge=PALETTE["navy"])
-    _arrow(ax, 5.8, 4.55, 6.7, 4.05, style="->", lw=1.0,
-           color=PALETTE["muted"])
-    _box(ax, 6.7, 3.5, 2.2, 0.5, "Dense features (ViT-H)",
-         color=PALETTE["softnavy"], edge=PALETTE["rule"], fontsize=10)
-
-    ax.axhline(3.2, color=PALETTE["rule"], linestyle="--", linewidth=0.8, xmin=0.02, xmax=0.98)
-
-    # Online training (bottom)
-    ax.text(0.2, 2.9, "ОНЛАЙН  ·  каждая итерация",
-            fontsize=10, fontweight="bold", color=PALETTE["muted"], style="italic")
-
-    # Batch
-    _box(ax, 0.5, 1.7, 1.6, 0.7, "Батч\nпатчей",
-         color=PALETTE["softnavy"], edge=PALETTE["navy"])
-    _arrow(ax, 2.1, 2.05, 2.9, 2.05)
-    _box(ax, 2.9, 1.7, 1.8, 0.7, "Augmentations\n(spatial + color)",
+    _arrow(ax, 2.3, 3.35, 3.1, 3.35, lw=1.6)
+    _box(ax, 3.1, 2.9, 2.2, 0.9, "Augmentations\n(spatial + color)",
          color=PALETTE["soft"], edge=PALETTE["rule"])
+    _arrow(ax, 5.3, 3.35, 6.1, 3.35, lw=1.6)
+    _box(ax, 6.1, 2.55, 2.8, 1.6, "Student\nFastViT-S12 (11.5M)\n+ decoder",
+         color=PALETTE["softgreen"], edge=PALETTE["green"], bold=True, lw=1.8)
 
-    # Soft target loading (синхронизированно)
-    _box(ax, 2.9, 0.7, 1.8, 0.6, "Soft targets (синхр.)",
-         color=PALETTE["softred"], edge=PALETTE["accent"], fontsize=10)
-    _arrow(ax, 7.7, 4.05, 4.5, 1.3, style="->", lw=1.0,
-           color=PALETTE["accent"], label="cache")
+    # Soft targets bridge down (right-side of disk → into online section)
+    _arrow(ax, 10.1, 5.7, 10.1, 4.4, lw=1.4, color=PALETTE["accent"], style="->")
+    ax.text(10.25, 5.05, " load + aug-sync",
+            fontsize=10, color=PALETTE["accent"], style="italic", va="center")
+    _box(ax, 8.9, 3.6, 2.6, 0.8, "Soft targets\n(spatially synced)",
+         color=PALETTE["softred"], edge=PALETTE["accent"], bold=True)
 
-    # Student
-    _arrow(ax, 4.7, 2.05, 5.6, 2.05)
-    _box(ax, 5.6, 1.5, 2.0, 1.1, "Student\nFastViT-S12 (11.5M)\n+ decoder",
-         color=PALETTE["softgreen"], edge=PALETTE["green"], bold=True)
-
-    # 3 heads
-    _arrow(ax, 7.6, 2.4, 8.6, 2.7, style="->")
-    _box(ax, 8.6, 2.55, 1.5, 0.45, "binary", color=PALETTE["soft"], edge=PALETTE["rule"], fontsize=10)
-    _arrow(ax, 7.6, 2.05, 8.6, 2.05, style="->")
-    _box(ax, 8.6, 1.85, 1.5, 0.45, "HV map", color=PALETTE["soft"], edge=PALETTE["rule"], fontsize=10)
-    _arrow(ax, 7.6, 1.7, 8.6, 1.4, style="->")
-    _box(ax, 8.6, 1.15, 1.5, 0.45, "type (6)", color=PALETTE["soft"], edge=PALETTE["rule"], fontsize=10)
+    # 3 heads to the right of student
+    _arrow(ax, 8.9, 3.7, 10.0, 3.7, lw=1.2)
+    # Three head boxes stacked vertically
+    head_x = 11.7; head_w = 1.4; head_h = 0.55
+    for i, (name, ypos) in enumerate([("binary", 3.95), ("HV map", 3.2), ("type (6)", 2.45)]):
+        _box(ax, head_x, ypos, head_w, head_h, name,
+             color=PALETTE["soft"], edge=PALETTE["rule"], fontsize=10)
+        _arrow(ax, 8.9, 3.35, head_x, ypos + head_h / 2, lw=0.7, color=PALETTE["muted"])
 
     # Loss block
-    _box(ax, 10.5, 1.5, 3.0, 1.6,
-         "Loss\nL = L_GT  +  α·L_KD\n(+ β·L_feature)",
-         color=PALETTE["soft"], edge=PALETTE["ink"], bold=True, lw=1.6)
+    _box(ax, 13.5, 2.7, 2.3, 1.5,
+         "Loss\nL = L_GT\n+  α·L_KD",
+         color=PALETTE["soft"], edge=PALETTE["ink"], bold=True, lw=1.8)
+    # Arrows from heads into loss
+    for ypos in (4.22, 3.47, 2.72):
+        _arrow(ax, head_x + head_w, ypos, 13.5, 3.45, lw=0.7, color=PALETTE["muted"])
+    # Soft targets into loss (clean vertical-then-right path approx)
+    _arrow(ax, 11.5, 4.0, 13.5, 3.7, lw=1.2, color=PALETTE["accent"], style="->")
 
-    # Arrows from heads to loss
-    for y in (2.77, 2.07, 1.37):
-        _arrow(ax, 10.1, y, 10.5, 2.3, lw=0.8, color=PALETTE["muted"])
+    # Backward arrow (separate row, bottom)
+    _arrow(ax, 14.6, 2.5, 7.5, 2.2, lw=2.0, color=PALETTE["green"], style="->")
+    ax.text(11.0, 2.05, "backward (gradients to student)",
+            ha="center", fontsize=10, color=PALETTE["green"], style="italic")
 
-    # Soft target arrow to loss
-    _arrow(ax, 4.7, 1.0, 11.2, 1.5, lw=1.0, color=PALETTE["accent"], style="->",
-           label="L_KD (KL / DKD / UFD)")
-
-    # Backward
-    _arrow(ax, 11.5, 1.5, 6.6, 1.5, lw=1.5, color=PALETTE["green"], style="->",
-           label="backward")
-
-    # Legend
+    # Legend (right side)
     legend_items = [
-        ("soft data flow", PALETTE["accent"]),
-        ("forward", PALETTE["ink"]),
-        ("backward", PALETTE["green"]),
+        ("forward (data)", PALETTE["ink"]),
+        ("soft target / KD signal", PALETTE["accent"]),
+        ("backward (gradient)", PALETTE["green"]),
     ]
-    handles = [Line2D([0], [0], color=c, lw=2, label=name) for name, c in legend_items]
-    ax.legend(handles=handles, loc="upper right", fontsize=10,
-              framealpha=0.95, frameon=True)
+    handles = [Line2D([0], [0], color=c, lw=2.5, label=name) for name, c in legend_items]
+    ax.legend(handles=handles, loc="lower left", bbox_to_anchor=(0.01, 0.02),
+              fontsize=10, framealpha=0.97, frameon=True)
+
+    # Caption note bottom
+    ax.text(8, 0.5,
+            "Teacher один раз прогоняется по датасету в fp16, его логиты кешируются на диск (≤ 10 ГБ).\n"
+            "При обучении ученика мягкие цели подгружаются и проходят через те же пространственные аугментации, что и изображение.",
+            ha="center", fontsize=10, color=PALETTE["muted"], style="italic")
 
     plt.savefig(OUT_DIR / "08_pipeline_diagram.png")
     plt.close(fig)

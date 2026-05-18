@@ -23,6 +23,7 @@ logs/sweep_*/
 logs/c3_sweep/
 logs/c4_*/
 logs/monuseg_sweep/
+logs/d2_*/
 .hf_home*/
 *.log
 

@@ -213,9 +213,9 @@ def fig_kd_variants():
                 arrowprops=dict(arrowstyle="->", color=PALETTE["accent"]))
     ax.annotate("", xy=(5.5, 1.7), xytext=(7.5, 3.0),
                 arrowprops=dict(arrowstyle="->", color=PALETTE["accent"]))
-    _box(ax, 3.0, 1.0, 4, 0.7,
-         "α·TCKD + β·NCKD,  β=8",
-         color=PALETTE["softnavy"], edge=PALETTE["navy"], bold=True)
+    _box(ax, 2.0, 1.0, 6, 0.7,
+         "α·TCKD + β·NCKD     (α = 1, β = 8)",
+         color=PALETTE["softnavy"], edge=PALETTE["navy"], bold=True, fontsize=11)
     ax.text(5, 0.2, "→ NCKD амплифицирует\nсигнал на редких классах",
             ha="center", fontsize=10, color=PALETTE["muted"], style="italic")
 
@@ -338,18 +338,24 @@ def fig_decoder_comparison():
         _arrow(ax, 4.0, y + 0.25, 6.0, y + 0.25, color=PALETTE["muted"], lw=1.0)
 
     fpn_y = [4.7, 3.9, 3.1, 2.3]
-    fpn_names = ["upsample + concat", "upsample + concat", "upsample + concat", "+ conv-conv"]
+    fpn_names = [
+        "upsample + concat\n+ conv-conv",
+        "upsample + concat\n+ conv-conv",
+        "upsample + concat\n+ conv-conv",
+        "upsample + conv-conv\n→ 32-ch feature",
+    ]
     for y, name in zip(fpn_y, fpn_names):
-        _box(ax, 6.0, y, 3.5, 0.5, name, color=PALETTE["soft"])
+        _box(ax, 6.0, y - 0.05, 3.5, 0.6, name,
+             color=PALETTE["soft"], edge=PALETTE["navy"], fontsize=10)
 
     for i in range(3):
-        ax.annotate("", xy=(7.75, fpn_y[i + 1] + 0.5),
-                    xytext=(7.75, fpn_y[i]),
+        ax.annotate("", xy=(7.75, fpn_y[i + 1] + 0.55),
+                    xytext=(7.75, fpn_y[i] - 0.05),
                     arrowprops=dict(arrowstyle="->", color=PALETTE["navy"]))
 
-    _box(ax, 6.0, 1.0, 3.5, 0.7, "32-ch feature → 3 головы",
+    _box(ax, 6.0, 1.0, 3.5, 0.7, "3 головы (binary / HV / type)",
          color=PALETTE["softgreen"], edge=PALETTE["green"], bold=True)
-    ax.annotate("", xy=(7.75, 1.7), xytext=(7.75, 2.3),
+    ax.annotate("", xy=(7.75, 1.7), xytext=(7.75, 2.2),
                 arrowprops=dict(arrowstyle="->", color=PALETTE["green"]))
 
     ax.text(5, 0.4, "Свёртки 3×3, билинейный upsample. ~3.1M параметров.",
@@ -368,23 +374,22 @@ def fig_decoder_comparison():
         _arrow(ax, 4.0, y + 0.25, 6.0, y + 0.25, color=PALETTE["muted"], lw=1.0)
 
     # PVM block detail
-    pvm_y = [4.5, 3.7, 2.9, 2.1]
+    pvm_y = [4.7, 3.9, 3.1, 2.3]
     for y in pvm_y:
-        # 4 groups
         for gi in range(4):
-            _box(ax, 6.0 + gi * 0.55, y, 0.5, 0.4, "M", color="#FFF1F0",
-                 edge=PALETTE["accent"], fontsize=9, bold=True)
-        ax.text(8.4, y + 0.2, "+ GN res", fontsize=9, color=PALETTE["muted"],
-                va="center")
+            _box(ax, 6.0 + gi * 0.62, y - 0.05, 0.55, 0.5, "M",
+                 color="#FFF1F0", edge=PALETTE["accent"], fontsize=10, bold=True)
+        ax.text(8.55, y + 0.2, "+ GN\nres", fontsize=8, color=PALETTE["muted"],
+                va="center", ha="left", style="italic")
 
     for i in range(3):
-        ax.annotate("", xy=(7.0, pvm_y[i + 1] + 0.4),
-                    xytext=(7.0, pvm_y[i]),
+        ax.annotate("", xy=(7.25, pvm_y[i + 1] + 0.45),
+                    xytext=(7.25, pvm_y[i] - 0.05),
                     arrowprops=dict(arrowstyle="->", color=PALETTE["accent"]))
 
-    _box(ax, 6.0, 1.0, 3.5, 0.7, "32-ch feature → 3 головы",
+    _box(ax, 6.0, 1.0, 3.5, 0.7, "3 головы (binary / HV / type)",
          color=PALETTE["softgreen"], edge=PALETTE["green"], bold=True)
-    ax.annotate("", xy=(7.5, 1.7), xytext=(7.5, 2.1),
+    ax.annotate("", xy=(7.25, 1.7), xytext=(7.25, 2.2),
                 arrowprops=dict(arrowstyle="->", color=PALETTE["green"]))
 
     ax.text(5, 0.4,
@@ -512,15 +517,20 @@ def fig_alpha_sensitivity():
     ax.grid(True, alpha=0.25, linestyle="--", linewidth=0.4)
     ax.legend(loc="lower right", fontsize=11)
 
-    ax.text(50, 0.42, "ожидаемая\nрабочая зона",
+    ax.text(45, 0.52, "ожидаемая\nрабочая зона",
             fontsize=10, color=PALETTE["muted"], style="italic", ha="center")
-    ax.text(50, 0.22, "коллапс KD\nна больших α",
+    ax.text(45, 0.18, "коллапс KD\nна больших α",
             fontsize=10, color=PALETTE["accent"], style="italic", ha="center")
+    ax.set_ylim(0, 0.65)
 
-    ax.text(2, 0.05,
-            "Иллюстрация: реальные кривые сохранены в logs/. На старом RTX 5060 Ti α=0.2 работал;\n"
-            "на 5090 + PyTorch 2.12 + CUDA 13 + batch 16 — нет. Требуется α ≈ 0.05.",
-            fontsize=9, color=PALETTE["muted"], style="italic")
+    # Caption text placed underneath the axes (not inside plot area)
+    fig.text(
+        0.5, -0.04,
+        "Иллюстрация: реальные кривые сохранены в logs/. На старом RTX 5060 Ti "
+        "α = 0.2 работал; на 5090 + PyTorch 2.12 + CUDA 13 + batch 16 — нет. "
+        "Требуется α ≈ 0.05.",
+        fontsize=10, color=PALETTE["muted"], style="italic", ha="center",
+    )
 
     plt.tight_layout()
     plt.savefig(OUT_DIR / "13_alpha_sensitivity.png")

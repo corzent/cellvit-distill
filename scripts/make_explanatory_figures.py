@@ -70,94 +70,124 @@ def _arrow(ax, x1, y1, x2, y2, color=None, label=None, lw=1.5, style="->"):
 
 
 # ============================================================
-# 08. Pipeline diagram — clean layout: offline top, online bottom,
-# cache flows down via a single vertical bridge.
+# 08. Pipeline diagram — single column of 4 stages with clear vertical
+# flow. No overlapping boxes, no diagonal arrows.
 # ============================================================
 def fig_pipeline():
     print("  [08] pipeline diagram")
-    fig, ax = plt.subplots(figsize=(16, 8))
-    ax.set_xlim(0, 16); ax.set_ylim(0, 8); ax.axis("off")
+    fig, ax = plt.subplots(figsize=(13, 9.5))
+    ax.set_xlim(0, 13); ax.set_ylim(0, 9.5); ax.axis("off")
 
-    ax.text(8, 7.6, "Сквозной пайплайн обучения с дистилляцией знаний",
+    ax.text(6.5, 9.1, "Сквозной пайплайн обучения с дистилляцией знаний",
             ha="center", fontsize=15, fontweight="bold", color=PALETTE["ink"])
 
-    # --- OFFLINE row (y ≈ 6) ---
-    ax.text(0.3, 6.85, "ОФФЛАЙН  ·  один раз",
+    # =========================================================
+    # Stage 1 (top): OFFLINE — Teacher → Cache
+    # =========================================================
+    y1 = 7.4
+    ax.text(0.3, 8.6, "1.  ОФФЛАЙН  ·  один раз",
             fontsize=11, fontweight="bold", color=PALETTE["muted"], style="italic")
 
-    _box(ax, 0.6, 5.7, 2.6, 0.9, "PanNuke\n7901 патч 256×256",
+    _box(ax, 0.6, y1, 2.6, 0.9, "PanNuke\n7901 патч",
          color=PALETTE["softnavy"], edge=PALETTE["navy"])
-    _arrow(ax, 3.2, 6.15, 4.2, 6.15, lw=1.6)
-    _box(ax, 4.2, 5.7, 3.4, 0.9, "Teacher\nCellViT-SAM-H (630M)",
-         color=PALETTE["softred"], edge=PALETTE["accent"], bold=True, lw=1.8)
-    _arrow(ax, 7.6, 6.15, 8.6, 6.15, lw=1.6)
-    _box(ax, 8.6, 5.7, 3.0, 0.9, "Soft targets\nна диск (fp16)",
+    _arrow(ax, 3.3, y1 + 0.45, 4.4, y1 + 0.45, lw=2)
+    _box(ax, 4.4, y1, 4.0, 0.9, "Teacher  CellViT-SAM-H  (630M)",
+         color=PALETTE["softred"], edge=PALETTE["accent"], bold=True, lw=2)
+    _arrow(ax, 8.5, y1 + 0.45, 9.6, y1 + 0.45, lw=2)
+    _box(ax, 9.6, y1, 3.0, 0.9, "Soft targets\nдиск (fp16, ≤ 10 ГБ)",
          color=PALETTE["softnavy"], edge=PALETTE["navy"], bold=True)
 
-    # Separator
-    ax.plot([0.3, 15.7], [5.0, 5.0], color=PALETTE["rule"],
+    # Separator before online section
+    ax.plot([0.3, 12.7], [6.65, 6.65], color=PALETTE["rule"],
             linestyle="--", linewidth=0.9, zorder=0)
 
-    # --- ONLINE row (y ≈ 3) ---
-    ax.text(0.3, 4.55, "ОНЛАЙН  ·  каждая итерация",
+    # =========================================================
+    # Stage 2: ONLINE — batch input + cached soft targets
+    # =========================================================
+    y2 = 5.4
+    ax.text(0.3, 6.3, "2.  ОНЛАЙН  ·  каждая итерация",
             fontsize=11, fontweight="bold", color=PALETTE["muted"], style="italic")
 
-    # Inputs
-    _box(ax, 0.6, 2.9, 1.7, 0.9, "Батч\nпатчей",
+    _box(ax, 0.6, y2, 3.5, 0.9, "Батч изображений\n+ GT-метки",
          color=PALETTE["softnavy"], edge=PALETTE["navy"])
-    _arrow(ax, 2.3, 3.35, 3.1, 3.35, lw=1.6)
-    _box(ax, 3.1, 2.9, 2.2, 0.9, "Augmentations\n(spatial + color)",
-         color=PALETTE["soft"], edge=PALETTE["rule"])
-    _arrow(ax, 5.3, 3.35, 6.1, 3.35, lw=1.6)
-    _box(ax, 6.1, 2.55, 2.8, 1.6, "Student\nFastViT-S12 (11.5M)\n+ decoder",
-         color=PALETTE["softgreen"], edge=PALETTE["green"], bold=True, lw=1.8)
 
-    # Soft targets bridge down (right-side of disk → into online section)
-    _arrow(ax, 10.1, 5.7, 10.1, 4.4, lw=1.4, color=PALETTE["accent"], style="->")
-    ax.text(10.25, 5.05, " load + aug-sync",
-            fontsize=10, color=PALETTE["accent"], style="italic", va="center")
-    _box(ax, 8.9, 3.6, 2.6, 0.8, "Soft targets\n(spatially synced)",
+    # Soft targets pulled from cache (vertical arrow from cache down)
+    _arrow(ax, 11.1, y1, 11.1, y2 + 0.9, lw=1.8,
+           color=PALETTE["accent"], style="->")
+
+    _box(ax, 9.1, y2, 3.5, 0.9, "Cached soft targets\n(2 + 6 каналов)",
          color=PALETTE["softred"], edge=PALETTE["accent"], bold=True)
 
-    # 3 heads to the right of student
-    _arrow(ax, 8.9, 3.7, 10.0, 3.7, lw=1.2)
-    # Three head boxes stacked vertically
-    head_x = 11.7; head_w = 1.4; head_h = 0.55
-    for i, (name, ypos) in enumerate([("binary", 3.95), ("HV map", 3.2), ("type (6)", 2.45)]):
-        _box(ax, head_x, ypos, head_w, head_h, name,
-             color=PALETTE["soft"], edge=PALETTE["rule"], fontsize=10)
-        _arrow(ax, 8.9, 3.35, head_x, ypos + head_h / 2, lw=0.7, color=PALETTE["muted"])
+    # Both flow into augmentations (next row)
+    _arrow(ax, 2.35, y2, 5.5, 4.6, lw=1.6)
+    _arrow(ax, 10.85, y2, 7.5, 4.6, lw=1.6, color=PALETTE["accent"])
 
-    # Loss block
-    _box(ax, 13.5, 2.7, 2.3, 1.5,
-         "Loss\nL = L_GT\n+  α·L_KD",
-         color=PALETTE["soft"], edge=PALETTE["ink"], bold=True, lw=1.8)
-    # Arrows from heads into loss
-    for ypos in (4.22, 3.47, 2.72):
-        _arrow(ax, head_x + head_w, ypos, 13.5, 3.45, lw=0.7, color=PALETTE["muted"])
-    # Soft targets into loss (clean vertical-then-right path approx)
-    _arrow(ax, 11.5, 4.0, 13.5, 3.7, lw=1.2, color=PALETTE["accent"], style="->")
+    # =========================================================
+    # Stage 3: synchronized augmentations
+    # =========================================================
+    y3 = 3.7
+    _box(ax, 4.0, y3, 5.0, 0.9,
+         "Synchronized augmentations\n(spatial + color, applied к обоим)",
+         color=PALETTE["soft"], edge=PALETTE["ink"], bold=True, lw=1.6)
 
-    # Backward arrow (separate row, bottom)
-    _arrow(ax, 14.6, 2.5, 7.5, 2.2, lw=2.0, color=PALETTE["green"], style="->")
-    ax.text(11.0, 2.05, "backward (gradients to student)",
-            ha="center", fontsize=10, color=PALETTE["green"], style="italic")
+    # Down to student
+    _arrow(ax, 6.5, y3, 6.5, 2.95, lw=2)
 
-    # Legend (right side)
+    # =========================================================
+    # Stage 4: student + 3 heads + loss
+    # =========================================================
+    y4 = 2.05
+    _box(ax, 0.6, y4, 3.2, 0.9, "Student\nFastViT-S12 (11.5M)",
+         color=PALETTE["softgreen"], edge=PALETTE["green"], bold=True, lw=2)
+
+    # 3 heads
+    head_x = 4.4; head_w = 2.4
+    _box(ax, head_x, y4 + 0.95, head_w, 0.45, "binary",
+         color=PALETTE["soft"], edge=PALETTE["rule"], fontsize=11)
+    _box(ax, head_x, y4 + 0.35, head_w, 0.45, "HV map",
+         color=PALETTE["soft"], edge=PALETTE["rule"], fontsize=11)
+    _box(ax, head_x, y4 - 0.25, head_w, 0.45, "type (6)",
+         color=PALETTE["soft"], edge=PALETTE["rule"], fontsize=11)
+
+    # Student → 3 heads
+    for hy in (y4 + 1.17, y4 + 0.57, y4 - 0.03):
+        _arrow(ax, 3.8, y4 + 0.45, head_x, hy, lw=1.0)
+
+    # Loss block on right
+    _box(ax, 8.5, y4 - 0.1, 4.0, 1.4,
+         "Loss\nL  =  L_GT  +  α·L_KD",
+         color=PALETTE["soft"], edge=PALETTE["ink"], bold=True, lw=2, fontsize=12)
+
+    # Heads → Loss arrows
+    for hy in (y4 + 1.17, y4 + 0.57, y4 - 0.03):
+        _arrow(ax, head_x + head_w, hy, 8.5, y4 + 0.6, lw=0.9, color=PALETTE["muted"])
+
+    # Soft targets feed into Loss too (from cache far right of augmentations)
+    _arrow(ax, 9.0, 3.7, 9.5, y4 + 1.3, lw=1.2, color=PALETTE["accent"])
+
+    # =========================================================
+    # Backward arrow — clean curve from Loss back to Student
+    # =========================================================
+    backw = FancyArrowPatch((10.5, y4 - 0.1), (2.2, y4 - 0.1),
+                            connectionstyle="arc3,rad=-0.25",
+                            arrowstyle="->", color=PALETTE["green"], lw=2.0,
+                            mutation_scale=16)
+    ax.add_patch(backw)
+    ax.text(6.3, 1.0, "backward (gradient → student)",
+            ha="center", fontsize=10, color=PALETTE["green"],
+            style="italic", fontweight="bold")
+
+    # =========================================================
+    # Legend (bottom left)
+    # =========================================================
     legend_items = [
-        ("forward (data)", PALETTE["ink"]),
-        ("soft target / KD signal", PALETTE["accent"]),
-        ("backward (gradient)", PALETTE["green"]),
+        ("forward (данные)", PALETTE["ink"]),
+        ("soft target / KD сигнал", PALETTE["accent"]),
+        ("backward (градиент)", PALETTE["green"]),
     ]
     handles = [Line2D([0], [0], color=c, lw=2.5, label=name) for name, c in legend_items]
-    ax.legend(handles=handles, loc="lower left", bbox_to_anchor=(0.01, 0.02),
+    ax.legend(handles=handles, loc="lower left", bbox_to_anchor=(0.02, 0.005),
               fontsize=10, framealpha=0.97, frameon=True)
-
-    # Caption note bottom
-    ax.text(8, 0.5,
-            "Teacher один раз прогоняется по датасету в fp16, его логиты кешируются на диск (≤ 10 ГБ).\n"
-            "При обучении ученика мягкие цели подгружаются и проходят через те же пространственные аугментации, что и изображение.",
-            ha="center", fontsize=10, color=PALETTE["muted"], style="italic")
 
     plt.savefig(OUT_DIR / "08_pipeline_diagram.png")
     plt.close(fig)
@@ -174,71 +204,112 @@ def fig_kd_variants():
     colors = [PALETTE["navy"], PALETTE["accent"], PALETTE["gold"]]
 
     for ax, title, color in zip(axes, titles, colors):
-        ax.set_xlim(0, 10); ax.set_ylim(0, 7); ax.axis("off")
-        ax.text(5, 6.5, title, ha="center", fontsize=13, fontweight="bold", color=color)
+        ax.set_xlim(0, 10); ax.set_ylim(0, 8); ax.axis("off")
+        ax.text(5, 7.6, title, ha="center", fontsize=14, fontweight="bold",
+                color=color)
 
-    # ---- KL ----
+    # ---------- KL ----------
     ax = axes[0]
-    _box(ax, 0.5, 5.2, 4, 0.6, "logits_student", color=PALETTE["soft"])
-    _box(ax, 5.5, 5.2, 4, 0.6, "logits_teacher", color=PALETTE["soft"])
-    ax.annotate("", xy=(5, 4.5), xytext=(2.5, 5.0),
-                arrowprops=dict(arrowstyle="->", color=PALETTE["muted"]))
-    ax.annotate("", xy=(5, 4.5), xytext=(7.5, 5.0),
-                arrowprops=dict(arrowstyle="->", color=PALETTE["muted"]))
-    _box(ax, 3.0, 3.5, 4, 0.8,
-         "softmax(·/T)", color=PALETTE["softnavy"], edge=PALETTE["navy"])
-    ax.annotate("", xy=(5, 2.5), xytext=(5, 3.5),
-                arrowprops=dict(arrowstyle="->", color=PALETTE["navy"]))
-    _box(ax, 3.0, 1.5, 4, 1.0,
-         "KL(p_s || p_t)\nуниформно по всем классам",
+    # Two parallel logit inputs at top
+    _box(ax, 0.5, 6.3, 3.8, 0.7, "logits_student",
+         color=PALETTE["soft"], edge=PALETTE["rule"])
+    _box(ax, 5.7, 6.3, 3.8, 0.7, "logits_teacher",
+         color=PALETTE["soft"], edge=PALETTE["rule"])
+
+    # Both flow into softmax(·/T) — central box
+    ax.annotate("", xy=(4.0, 5.4), xytext=(2.4, 6.3),
+                arrowprops=dict(arrowstyle="->", color=PALETTE["muted"], lw=1.2))
+    ax.annotate("", xy=(6.0, 5.4), xytext=(7.6, 6.3),
+                arrowprops=dict(arrowstyle="->", color=PALETTE["muted"], lw=1.2))
+    _box(ax, 2.5, 4.5, 5.0, 0.9, "σ(·/T)  softmax with temperature",
          color=PALETTE["softnavy"], edge=PALETTE["navy"], bold=True)
-    ax.text(5, 0.6, "→ редкие классы тонут\nв доминирующем background",
+
+    # Down to KL
+    ax.annotate("", xy=(5, 3.5), xytext=(5, 4.5),
+                arrowprops=dict(arrowstyle="->", color=PALETTE["navy"], lw=1.5))
+    _box(ax, 2.5, 2.4, 5.0, 1.1,
+         "L_KL = T² · KL(p_t || p_s)\nуниформно по всем классам",
+         color=PALETTE["softnavy"], edge=PALETTE["navy"], bold=True)
+
+    ax.text(5, 1.3, "→ редкие классы тонут\nв доминирующем background",
             ha="center", fontsize=10, color=PALETTE["muted"], style="italic")
 
-    # ---- DKD ----
+    # ---------- DKD ----------
     ax = axes[1]
-    _box(ax, 0.5, 5.2, 4, 0.6, "logits_student", color=PALETTE["soft"])
-    _box(ax, 5.5, 5.2, 4, 0.6, "logits_teacher", color=PALETTE["soft"])
-    ax.annotate("", xy=(5, 4.5), xytext=(2.5, 5.0),
-                arrowprops=dict(arrowstyle="->", color=PALETTE["muted"]))
-    ax.annotate("", xy=(5, 4.5), xytext=(7.5, 5.0),
-                arrowprops=dict(arrowstyle="->", color=PALETTE["muted"]))
-    _box(ax, 0.5, 3.0, 4, 1.3,
-         "TCKD\nKL по target-классу\n(уверенность)",
+    _box(ax, 0.5, 6.3, 3.8, 0.7, "logits_student",
+         color=PALETTE["soft"], edge=PALETTE["rule"])
+    _box(ax, 5.7, 6.3, 3.8, 0.7, "logits_teacher",
+         color=PALETTE["soft"], edge=PALETTE["rule"])
+
+    # Decomposition box
+    ax.annotate("", xy=(4.0, 5.4), xytext=(2.4, 6.3),
+                arrowprops=dict(arrowstyle="->", color=PALETTE["muted"], lw=1.2))
+    ax.annotate("", xy=(6.0, 5.4), xytext=(7.6, 6.3),
+                arrowprops=dict(arrowstyle="->", color=PALETTE["muted"], lw=1.2))
+    _box(ax, 2.5, 4.6, 5.0, 0.8, "split  KL  →  TCKD  +  NCKD",
          color=PALETTE["softred"], edge=PALETTE["accent"], bold=True)
-    _box(ax, 5.5, 3.0, 4, 1.3,
-         "NCKD\nKL по не-target классам\n(тёмное знание)",
-         color=PALETTE["softred"], edge=PALETTE["accent"], bold=True)
-    ax.annotate("", xy=(4.5, 1.7), xytext=(2.5, 3.0),
+
+    # Two children boxes
+    ax.annotate("", xy=(2.3, 3.6), xytext=(4.0, 4.6),
                 arrowprops=dict(arrowstyle="->", color=PALETTE["accent"]))
-    ax.annotate("", xy=(5.5, 1.7), xytext=(7.5, 3.0),
+    ax.annotate("", xy=(7.7, 3.6), xytext=(6.0, 4.6),
                 arrowprops=dict(arrowstyle="->", color=PALETTE["accent"]))
-    _box(ax, 2.0, 1.0, 6, 0.7,
-         "α·TCKD + β·NCKD     (α = 1, β = 8)",
+    _box(ax, 0.3, 2.5, 4.0, 1.1,
+         "TCKD\nKL на target-классе",
+         color="#FCEAE7", edge=PALETTE["accent"])
+    _box(ax, 5.7, 2.5, 4.0, 1.1,
+         "NCKD\nKL по не-target классам",
+         color="#FCEAE7", edge=PALETTE["accent"])
+
+    # Sum into weighted combination
+    ax.annotate("", xy=(4.5, 1.7), xytext=(2.3, 2.5),
+                arrowprops=dict(arrowstyle="->", color=PALETTE["accent"]))
+    ax.annotate("", xy=(5.5, 1.7), xytext=(7.7, 2.5),
+                arrowprops=dict(arrowstyle="->", color=PALETTE["accent"]))
+    _box(ax, 1.5, 0.9, 7.0, 0.8,
+         "L_DKD  =  α · TCKD  +  β · NCKD     (α = 1,   β = 8)",
          color=PALETTE["softnavy"], edge=PALETTE["navy"], bold=True, fontsize=11)
-    ax.text(5, 0.2, "→ NCKD амплифицирует\nсигнал на редких классах",
+
+    ax.text(5, 0.15, "→ NCKD амплифицирует сигнал на редких классах",
             ha="center", fontsize=10, color=PALETTE["muted"], style="italic")
 
-    # ---- UFD ----
+    # ---------- UFD ----------
     ax = axes[2]
-    _box(ax, 0.5, 5.2, 4, 0.6, "logits_student", color=PALETTE["soft"])
-    _box(ax, 5.5, 5.2, 4, 0.6, "logits_teacher", color=PALETTE["soft"])
-    ax.annotate("", xy=(5, 4.6), xytext=(5, 5.2),
-                arrowprops=dict(arrowstyle="->", color=PALETTE["muted"]))
-    _box(ax, 3.0, 4.0, 4, 0.6, "DCT-II (H×W)",
-         color=PALETTE["soft"], edge=PALETTE["gold"])
-    ax.annotate("", xy=(2.5, 3.0), xytext=(4, 4.0),
-                arrowprops=dict(arrowstyle="->", color=PALETTE["gold"]))
-    ax.annotate("", xy=(7.5, 3.0), xytext=(6, 4.0),
-                arrowprops=dict(arrowstyle="->", color=PALETTE["gold"]))
-    _box(ax, 0.5, 2.2, 4, 0.8, "LF (32×32)\nглобальная структура",
-         color="#FFF8E1", edge=PALETTE["gold"])
-    _box(ax, 5.5, 2.2, 4, 0.8, "HF (остальное)\nграницы, мелкое",
-         color="#FFF8E1", edge=PALETTE["gold"])
-    _box(ax, 3.0, 0.9, 4, 0.7,
-         "w_lf·MSE_lf + w_hf·MSE_hf",
+    _box(ax, 0.5, 6.3, 3.8, 0.7, "logits_student",
+         color=PALETTE["soft"], edge=PALETTE["rule"])
+    _box(ax, 5.7, 6.3, 3.8, 0.7, "logits_teacher",
+         color=PALETTE["soft"], edge=PALETTE["rule"])
+
+    # Both → DCT
+    ax.annotate("", xy=(4.0, 5.4), xytext=(2.4, 6.3),
+                arrowprops=dict(arrowstyle="->", color=PALETTE["muted"], lw=1.2))
+    ax.annotate("", xy=(6.0, 5.4), xytext=(7.6, 6.3),
+                arrowprops=dict(arrowstyle="->", color=PALETTE["muted"], lw=1.2))
+    _box(ax, 2.5, 4.6, 5.0, 0.8, "DCT-II  по (H, W)",
          color="#FFF8E1", edge=PALETTE["gold"], bold=True)
-    ax.text(5, 0.1, "→ negative result:\nLF доминирует HF в ×600",
+
+    # Split into LF and HF
+    ax.annotate("", xy=(2.3, 3.6), xytext=(4.0, 4.6),
+                arrowprops=dict(arrowstyle="->", color=PALETTE["gold"]))
+    ax.annotate("", xy=(7.7, 3.6), xytext=(6.0, 4.6),
+                arrowprops=dict(arrowstyle="->", color=PALETTE["gold"]))
+    _box(ax, 0.3, 2.5, 4.0, 1.1,
+         "LF (K×K)\nглобальная структура",
+         color="#FFF8E1", edge=PALETTE["gold"])
+    _box(ax, 5.7, 2.5, 4.0, 1.1,
+         "HF (остальное)\nграницы, мелкое",
+         color="#FFF8E1", edge=PALETTE["gold"])
+
+    # Weighted MSE
+    ax.annotate("", xy=(4.5, 1.7), xytext=(2.3, 2.5),
+                arrowprops=dict(arrowstyle="->", color=PALETTE["gold"]))
+    ax.annotate("", xy=(5.5, 1.7), xytext=(7.7, 2.5),
+                arrowprops=dict(arrowstyle="->", color=PALETTE["gold"]))
+    _box(ax, 1.5, 0.9, 7.0, 0.8,
+         "L_UFD  =  w_LF · MSE_LF  +  w_HF · MSE_HF",
+         color="#FFF8E1", edge=PALETTE["gold"], bold=True, fontsize=11)
+
+    ax.text(5, 0.15, "→ negative result:  LF доминирует HF в ×600",
             ha="center", fontsize=10, color=PALETTE["accent"],
             style="italic", fontweight="bold")
 

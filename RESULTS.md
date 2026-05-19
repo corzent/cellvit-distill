@@ -299,3 +299,138 @@ applicable — F1-detection follows the same ranking.)
   - Teacher reference number 0.592 vs paper-reported 0.510 still
     unresolved (likely protocol difference — to be reconciled before
     quoting "79 % of teacher quality").
+
+
+---
+
+## Update 2026-05-19 — Mamba 3-fold CV + cross-dataset stats
+
+Supersedes the 2026-05-18 1-fold pilot section above with proper 3-fold
+mean ± std and paired-Wilcoxon tests on per-image PQ. All Mamba
+conditions now have **n=3 folds** on PanNuke and **n=42 image-level
+samples** (14 images × 3 folds) on MoNuSeg.
+
+### Final Mamba decoder ablation (PanNuke 3-fold TTA)
+
+| Decoder config | KD | Params | mPQ (TTA) | bPQ (TTA) | F1 (TTA) |
+|---|---|---|---|---|---|
+| cross_scan_4way d=64 | none | 10.7M | **0.4701 ± 0.0068** | 0.5916 ± 0.0063 | 0.7186 ± 0.0076 |
+| cross_scan_4way d=64 | KL  | 10.7M | 0.4687 ± 0.0075 | 0.5885 ± 0.0056 | 0.7178 ± 0.0081 |
+| cross_scan_4way d=64 | DKD | 10.7M | 0.4576 ± 0.0092 | 0.5805 ± 0.0075 | 0.7096 ± 0.0093 |
+| bidirectional d=16 (default) | none | 9.8M | 0.4696 ± 0.0093 | 0.5905 ± 0.0071 | 0.7174 ± 0.0077 |
+
+Reference (3-fold from earlier table, identical recipe):
+
+| Decoder | KD | Params | mPQ (TTA) |
+|---|---|---|---|
+| HoVer-Net (conv) | none | 11.5M | 0.4655 ± 0.0024 |
+| HoVer-Net (conv) | response KD (KL) | 11.5M | 0.4698 ± 0.0023 |
+
+### Paired stats on PanNuke per-image mPQ (n=7558 patches, concat 3 folds)
+
+| A | B | Δ (B − A) | 95 % bootstrap CI | Wilcoxon p |
+|---|---|---|---|---|
+| Mamba no-KD | Mamba + KL | −0.0014 | [−0.0041, +0.0012] | 7.1×10⁻³ |
+| Mamba no-KD | Mamba + DKD | −0.0124 | [−0.0150, −0.0098] | 5.5×10⁻²⁹ |
+| Mamba no-KD | Mamba default | −0.0005 | [−0.0030, +0.0019] | 0.10 |
+| Mamba + KL | Mamba + DKD | −0.0110 | [−0.0134, −0.0086] | 5.6×10⁻²³ |
+
+### MoNuSeg zero-shot 3-fold (TTA, n=14 images × 3 folds = 42)
+
+| Decoder config | KD | bPQ (TTA) | F1 (TTA) |
+|---|---|---|---|
+| cross_scan_4way d=64 | none | 0.5499 ± 0.0277 | 0.7244 ± 0.0369 |
+| cross_scan_4way d=64 | KL  | 0.4843 ± 0.0579 | 0.6398 ± 0.0762 |
+| cross_scan_4way d=64 | DKD | 0.4636 ± 0.0794 | 0.6131 ± 0.1097 |
+| bidirectional d=16 (default) | none | **0.5636 ± 0.0146** | **0.7478 ± 0.0176** |
+
+### Paired stats on MoNuSeg per-image bPQ (n=42)
+
+| A | B | Δ | 95 % CI | Wilcoxon p |
+|---|---|---|---|---|
+| Mamba no-KD | Mamba + KL | −0.066 | [−0.103, −0.031] | 2.0×10⁻³ |
+| Mamba no-KD | Mamba + DKD | −0.086 | [−0.121, −0.054] | 8.2×10⁻⁷ |
+| Mamba no-KD | Mamba default | +0.014 | [−0.002, +0.031] | 0.13 |
+| Mamba + KL | Mamba + DKD | −0.021 | [−0.048, +0.010] | 1.9×10⁻² |
+
+### Findings after 3-fold CV — which 1-fold pilot claims survive
+
+1. **Mamba ≈ HoVer at matched budget on PanNuke.** Mamba cs4_d64 no-KD
+   0.4701 ± 0.0068 vs HoVer baseline 0.4655 ± 0.0024 — within 1 σ. The
+   default (10 % smaller, simpler) Mamba is also at 0.4696 ± 0.0093.
+   **Claim survives 3-fold.** Mamba decoder is competitive with conv
+   decoder under the same FastViT-S12 encoder and ≤15 M cap.
+
+2. **"KL distill hurts Mamba on PanNuke" — REVISED.** 1-fold (fold 3)
+   showed KL costs −0.005 mPQ. 3-fold finds −0.0014 ± noise. Paired
+   Wilcoxon at n=7558 patches gives p=7×10⁻³ — statistically significant
+   but the effect size is tiny. Within fold-noise (±0.0068 std), KL on
+   Mamba is essentially a wash.
+
+3. **DKD on Mamba is consistently worse on PanNuke.** −0.0124 mPQ vs
+   no-KD (Wilcoxon p = 5.5×10⁻²⁹). Per-class breakdown: Dead PQ does
+   NOT recover under DKD's NCKD reweighting (β = 8): 0.1595 ± 0.0382
+   vs no-KD 0.1630 ± 0.0435. **The rare-class motivation for DKD does
+   not transfer to PanNuke segmentation in our setup.**
+
+4. **KD into Mamba is catastrophic for domain shift.** This is the
+   strongest result of the session.
+   * KL on MoNuSeg: −0.066 bPQ vs no-KD baseline, Wilcoxon p = 2×10⁻³
+   * DKD on MoNuSeg: −0.086 bPQ vs no-KD, p = 8×10⁻⁷
+
+   Within-domain the penalty is fold-noise; cross-domain it is large
+   and consistent. The teacher's PanNuke-specific decision boundary is
+   being memorized by the SSM student in a way that does not survive
+   the stain / scanner / organ shift to MoNuSeg.
+
+5. **"Mamba default beats cs4_d64 on MoNuSeg" — DIRECTION holds,
+   significance does not at n=42.** Default 0.5636 ± 0.0146 vs cs4_d64
+   0.5499 ± 0.0277, Δ = +0.014, paired Wilcoxon p = 0.13. The
+   capacity / generalization trade-off is visible (smaller arch, lower
+   PanNuke variance, smaller MoNuSeg gap) but not statistically
+   significant at this sample size. Direction-only claim is defensible
+   with the caveat noted.
+
+### Thesis story (post-3-fold)
+
+  - **Architecture matched-budget ablation (conv vs SSM)** — Mamba
+    decoder ties conv decoder on PanNuke within fold-noise at matched
+    encoder and ≤15 M cap. First such matched-budget comparison for
+    PanNuke nuclei segmentation in the lightweight regime.
+  - **KD-into-Mamba is harmful for cross-dataset generalization** —
+    statistically significant on both KL and DKD on MoNuSeg, while
+    PanNuke effect is within noise. New finding: SSM students inherit
+    teacher's in-domain bias more strongly than they inherit
+    distillation's generalization benefits.
+  - **DKD's rare-class hypothesis fails for dense prediction on
+    PanNuke** — NCKD reweighting at β=8 does not help Dead class;
+    overall mPQ drops 0.012, Wilcoxon p ≪ 0.001.
+  - **UFD-KD adaptation fails by magnitude imbalance** (documented
+    earlier).
+
+### Reproducibility artefacts (Update 2026-05-19)
+
+  - Code branches: `dev/post-master-work` (active dev); merged into
+    `master` are `feat/ablation-grid-runner` + `docs/related-work`.
+  - D2 sweep results: `logs/d2_critical/runs/` (8 run dirs, ckpts +
+    eval JSONs + per-image npz); aggregate `logs/d2_critical/summary.tsv`.
+  - MoNuSeg D2 results: each `logs/d2_critical/runs/<cell>/` also
+    contains `eval_monuseg{,_tta}{,_per_image.npz}`; aggregate at
+    `logs/monuseg_d2/summary.tsv`.
+  - Sweep scripts: `scripts/d2_critical.sh`,
+    `scripts/d2_critical_resume.sh` (after the branch-switch incident,
+    see EXPERIMENT_LOG.md 2026-05-19),
+    `scripts/e_monuseg_d2_followup.sh`.
+  - Aggregator: `scripts/d2_aggregate.py` — recomputes every table in
+    this section from the on-disk JSONs and npz arrays.
+
+### Remaining work for a fully closed thesis
+
+  - **HoVer + DKD 3-fold** — never trained. Would close the
+    `{conv, mamba} × {no-KD, KL, DKD}` grid.
+  - **B5 α/T sweep on Mamba** — could the KL/DKD harm be avoided with
+    Mamba-tuned hyperparameters?
+  - **Teacher reference 0.592 vs 0.510 protocol gap** — still open.
+  - **Per-image Wilcoxon between Mamba conditions and HoVer + KL**
+    (master result) — needs HoVer per-image arrays recomputed (the
+    master 3-fold run did not save them; only aggregate JSON).

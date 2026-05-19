@@ -791,3 +791,124 @@ Phase D2 ablation grid would cover all of these.
   - `feat/monuseg-eval`          427369a — MoNuSeg adapter + HF migration
     (mirrored onto dev/ via cherry-pick db46937 + 600e637)
   - `docs/related-work`          6a97b19 — thesis literature notes
+
+
+---
+
+## 2026-05-19 — D2 critical 3-fold sweep + branch-switch incident
+
+### Phase D2 reduced (8 cells, ~7.5 wallclock hours)
+
+After the 1-fold pilot session of 2026-05-18, the four headline Mamba
+claims still needed multi-fold confirmation. To stay under the budget
+we reused fold 3 from the earlier C3 / C4 runs and added folds 1 + 2:
+
+  - 4 conditions × 2 new folds = 8 cells
+  - Conditions: mamba_cs4_d64 {no-KD, KL, DKD} + mamba_default no-KD
+  - Recipe identical to C3/C4 (60 ep, batch 64, bf16, class-balanced
+    sampling, early stop 12). Cells average 75–98 min for cs4_d64 and
+    ~50 min for default.
+
+Sweep harness: `scripts/d2_critical.sh` initial, then
+`scripts/d2_critical_resume.sh` after the incident below.
+
+### Branch-switch incident (mid-sweep)
+
+After cell 1 (mamba_cs4_no_kd_fold1) had started training, I switched
+git from `dev/post-master-work` to `master` to merge two safe branches
+(feat/ablation-grid-runner + docs/related-work) and forgot to switch
+back before subsequent cells launched.
+
+Failure mode:
+
+  - The bash sweep wrapper persists across cells. Each `python -m
+    cellvit_distill.scripts.train` subprocess reads code FROM DISK at
+    its own startup.
+  - Cell 1 train (already running): code in memory was the dev/ version
+    with the `decoder_type` wiring → built Mamba correctly → checkpoint
+    is a valid Mamba.
+  - Cell 1 eval (post-train subprocess): launched after the master
+    switch → loaded master's student.py (no `decoder_type` kwarg) →
+    built HoVer decoder → state_dict load mismatch → eval FAILED.
+  - Cell 2, cell 3 train: also launched after master switch → built
+    HoVer decoder despite `student.decoder_type=mamba` override → ~90
+    minutes of GPU wasted on the wrong architecture.
+
+Recovery:
+
+  - Killed the sweep, switched back to dev/post-master-work, verified
+    `grep -c "decoder_type" cellvit_distill/models/student.py == 6`.
+  - Deleted the 2 wrong run dirs (`distill_fastvit_s12_140532` and
+    `_140645`).
+  - Re-evaluated cell 1's preserved Mamba checkpoint manually
+    (mPQ_TTA 0.4759).
+  - Wrote `scripts/d2_critical_resume.sh` covering the remaining 7
+    cells with the correct working tree.
+
+Lesson saved to memory:
+`/root/.claude/projects/-workspace/memory/feedback_no_branch_switch_during_subprocess.md`.
+Rule: never switch branches while a long sweep is in flight; subprocess
+imports read live disk state and silently break.
+
+### 3-fold final numbers
+
+All values 3-fold mean ± std, mPQ TTA (PanNuke). Mamba conditions
+pulled together from `logs/c3_sweep/`, `logs/c4_*/`, `logs/mamba_baseline/`,
+and `logs/d2_critical/`.
+
+| Condition       | mPQ TTA          | MoNuSeg bPQ TTA  |
+|-----------------|------------------|------------------|
+| mamba_cs4_no_kd | 0.4701 ± 0.0068  | 0.5499 ± 0.0277  |
+| mamba_cs4_kl    | 0.4687 ± 0.0075  | 0.4843 ± 0.0579  |
+| mamba_cs4_dkd   | 0.4576 ± 0.0092  | 0.4636 ± 0.0794  |
+| mamba_default   | 0.4696 ± 0.0093  | 0.5636 ± 0.0146  |
+
+Reference 3-fold (from earlier RESULTS table):
+
+| Condition                     | mPQ TTA          |
+|-------------------------------|------------------|
+| HoVer-Net baseline (no KD)    | 0.4655 ± 0.0024  |
+| HoVer-Net + KL distill        | 0.4698 ± 0.0023  |
+
+### What the 1-fold pilot got right vs wrong
+
+| Pilot claim (fold 3 only)              | After 3-fold | Detail |
+|----------------------------------------|--------------|--------|
+| Mamba ≈ HoVer on PanNuke               | SURVIVED     | Mamba 0.4701 vs HoVer 0.4655, within 1σ |
+| KL hurts Mamba on PanNuke (−0.005)     | REVISED      | −0.0014 mPQ, within noise; Wilcoxon p=7e-3 but tiny effect |
+| DKD hurts Mamba on PanNuke (−0.009)    | CONFIRMED    | −0.0124 mPQ, Wilcoxon p=5.5e-29 |
+| KD on Mamba catastrophic on MoNuSeg    | CONFIRMED    | −0.066 / −0.086 bPQ, Wilcoxon p=2e-3 / 8e-7 |
+| Default Mamba generalizes better       | DIRECTION    | +0.014 bPQ, p=0.13 (not sig at n=42) |
+
+### Paired-Wilcoxon details
+
+PanNuke per-image mPQ, all four pairwise comparisons saved in the
+output of `scripts/d2_aggregate.py`. 4 of 4 PanNuke comparisons reach
+statistical significance at p < 0.05 with the n=7558 per-image sample,
+though effect sizes range from 0.001 mPQ (KL vs no-KD) to 0.012 mPQ
+(DKD vs no-KD).
+
+MoNuSeg per-image bPQ at n=42 (14 imgs × 3 folds): KD-on-Mamba effects
+are large enough to be significant; default-vs-cs4 is borderline.
+
+### Reproducibility artefacts (2026-05-19)
+
+  - `scripts/d2_critical.sh` + `scripts/d2_critical_resume.sh` — sweep
+    drivers
+  - `scripts/e_monuseg_d2_followup.sh` — cross-dataset eval driver
+  - `scripts/d2_aggregate.py` — recomputes every table in
+    RESULTS.md §Update 2026-05-19 from on-disk JSONs and npz arrays
+  - `logs/d2_critical/runs/*/` — 8 run dirs with checkpoints + eval
+    JSONs + per-image npz (PanNuke + MoNuSeg)
+  - `logs/d2_critical/summary.tsv` — PanNuke per-cell row
+  - `logs/monuseg_d2/summary.tsv` — MoNuSeg per-cell row
+
+### Open questions kept for future sessions
+
+  - HoVer-Net + DKD 3-fold (never trained)
+  - Mamba-specific α/T sweep (could KD harm be avoided with retuned
+    hyperparameters?)
+  - Teacher reference 0.592 vs 0.510 protocol gap
+  - Per-image Wilcoxon between Mamba conditions and HoVer+KL — needs
+    HoVer 3-fold per-image arrays recomputed (master 3-fold only saved
+    scalar JSONs).
